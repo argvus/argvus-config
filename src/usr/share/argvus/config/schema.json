@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ARGVUS user configuration",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "appearance": { "type": "object" },
+    "layout": { "type": "object" },
+    "effects": { "type": "object" },
+    "fonts": {
+      "type": "object",
+      "properties": {
+        "targets": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "family": { "type": "string" },
+              "style": { "type": "string" },
+              "size": { "type": "integer", "minimum": 8, "maximum": 32 }
+            }
+          }
+        },
+        "rendering": {
+          "type": "object",
+          "properties": {
+            "antialias": { "type": "boolean" },
+            "hinting": { "type": "string" },
+            "subpixel": { "type": "string" },
+            "custom_dpi": { "type": "boolean" },
+            "dpi": { "type": "integer", "minimum": 72, "maximum": 240 }
+          }
+        },
+        "legacy": { "type": "string" }
+      }
+    },
+    "control_panel": { "type": "object" },
+    "defaults": { "type": "object" },
+    "hyprland": {
+      "type": "object",
+      "properties": {
+        "keybindings": { "type": "object" },
+        "input": { "type": "object" },
+        "keyboard": { "type": "object" }
+      }
+    },
+    "displays": {
+      "type": "object",
+      "properties": {
+        "primary_monitor": { "type": ["string", "null"] },
+        "monitors": { "type": "object" },
+        "workspaces": { "type": "object" }
+      }
+    },
+    "power": {
+      "type": "object",
+      "properties": {
+        "screen_off_minutes": { "type": "integer", "minimum": 0 },
+        "lock_minutes": { "type": "integer", "minimum": 0 },
+        "keep_awake": { "type": "boolean" },
+        "lid_battery": { "type": "string" },
+        "lid_ac": { "type": "string" },
+        "power_button": { "type": "string" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "properties": { "language": { "type": "string" } }
+    },
+    "calendar": { "type": "object" },
+    "removable_devices": { "type": "object" },
+    "extensions": { "type": "object" }
+  }
+}

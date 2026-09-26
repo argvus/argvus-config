@@ -1,0 +1,25 @@
+# Maintainer: ARGVUS
+pkgname=argvus-config
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Canonical ARGVUS user configuration model and CLI"
+arch=('x86_64')
+url="https://github.com/argvus/argvus-config"
+license=('GPL-3.0-only')
+depends=('glibc')
+makedepends=('cargo')
+options=('!debug')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=()
+
+_functions_file="${startdir:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}/../common/functions.sh"
+. "$_functions_file"
+
+build() {
+	cd "$srcdir/$pkgname-$pkgver"
+	cargo build --release --locked
+}
+
+prepare() { arch_normalize_source_tree; }
+check() { arch_check_payload; }
+package() { arch_package_payload; }

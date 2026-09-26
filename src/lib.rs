@@ -448,6 +448,7 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .or_insert_with(|| Value::Bool(true));
     for (surface, transparency) in [
         ("taskbar", 90),
+        ("launchers", 50),
         ("widget-telemetry", 90),
         ("control-panel", 90),
         ("terminal", 50),
@@ -1409,6 +1410,10 @@ mod tests {
         );
         assert_eq!(
             effects.get("transparency_terminal_value"),
+            Some(&Value::Number(50.into()))
+        );
+        assert_eq!(
+            effects.get("transparency_launchers_value"),
             Some(&Value::Number(50.into()))
         );
         assert_eq!(

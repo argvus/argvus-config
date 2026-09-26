@@ -437,6 +437,44 @@ fn apply_defaults(document: &mut ConfigDocument) {
     object
         .entry("gtk_mode")
         .or_insert_with(|| Value::String("dark".into()));
+
+    let effects = document
+        .sections
+        .entry("effects".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let effects = effects.as_object_mut().expect("effects is object");
+    effects
+        .entry("animations")
+        .or_insert_with(|| Value::Bool(true));
+    for (surface, transparency) in [
+        ("taskbar", 90),
+        ("widget-telemetry", 90),
+        ("control-panel", 90),
+        ("terminal", 50),
+        ("control-center", 50),
+    ] {
+        effects
+            .entry(format!("transparency_{surface}_enabled"))
+            .or_insert_with(|| Value::Bool(true));
+        effects
+            .entry(format!("transparency_{surface}_value"))
+            .or_insert_with(|| Value::Number(transparency.into()));
+        effects
+            .entry(format!("blur_{surface}_enabled"))
+            .or_insert_with(|| Value::Bool(true));
+    }
+    effects
+        .entry("blur_global_value")
+        .or_insert_with(|| Value::Number(50.into()));
+    effects
+        .entry("transparency_control-center_enabled")
+        .or_insert_with(|| Value::Bool(true));
+    effects
+        .entry("transparency_control-center_value")
+        .or_insert_with(|| Value::Number(50.into()));
+    effects
+        .entry("blur_control-center_enabled")
+        .or_insert_with(|| Value::Bool(true));
 }
 
 fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
@@ -1352,5 +1390,50 @@ mod tests {
             Some("argvus-dark-float")
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_profiles_receive_effect_defaults_without_overwriting_values() {
+        let empty = ConfigDocument::default();
+        let path = env::temp_dir().join(format!(
+            "argvus-config-defaults-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let effective = ConfigDocument::load_effective(&path).unwrap();
+        let effects = effective.sections.get("effects").unwrap();
+        assert_eq!(effects.get("animations"), Some(&Value::Bool(true)));
+        assert_eq!(
+            effects.get("transparency_taskbar_value"),
+            Some(&Value::Number(90.into()))
+        );
+        assert_eq!(
+            effects.get("transparency_terminal_value"),
+            Some(&Value::Number(50.into()))
+        );
+        assert_eq!(
+            effects.get("transparency_control-center_value"),
+            Some(&Value::Number(50.into()))
+        );
+        assert_eq!(
+            effects.get("blur_global_value"),
+            Some(&Value::Number(50.into()))
+        );
+
+        let mut existing = empty;
+        existing
+            .set(
+                "/effects/transparency_control-center_value",
+                Value::Number(80.into()),
+            )
+            .unwrap();
+        let existing_path = path.with_extension("existing.json");
+        fs::write(&existing_path, serde_json::to_vec(&existing).unwrap()).unwrap();
+        let preserved = ConfigDocument::load_effective(&existing_path).unwrap();
+        assert_eq!(
+            preserved.get("/effects/transparency_control-center_value"),
+            Some(&Value::Number(80.into()))
+        );
+        let _ = fs::remove_file(existing_path);
     }
 }

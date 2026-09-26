@@ -479,7 +479,25 @@ fn validate_layout(document: &ConfigDocument) -> ConfigResult<()> {
 }
 
 fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
-    validate_numeric_section(document, "effects", 0, 100)
+    let Some(effects) = document.sections.get("effects") else {
+        return Ok(());
+    };
+    for (key, value) in effects.as_object().expect("validated section object") {
+        if value.is_boolean() {
+            continue;
+        }
+        let Some(number) = value.as_i64() else {
+            return Err(ConfigError::Invalid(format!(
+                "effects.{key} must be a boolean or an integer between 0 and 100"
+            )));
+        };
+        if !(0..=100).contains(&number) {
+            return Err(ConfigError::Invalid(format!(
+                "effects.{key} must be between 0 and 100"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_fonts(document: &ConfigDocument) -> ConfigResult<()> {

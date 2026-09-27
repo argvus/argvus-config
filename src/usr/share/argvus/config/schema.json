@@ -104,7 +104,30 @@
       }
     },
     "control_panel": { "type": "object" },
-    "defaults": { "type": "object" },
+    "default_apps": {
+      "type": "object",
+      "properties": {
+        "terminal": { "type": "string" },
+        "file_manager": { "type": "string" },
+        "text_editor": { "type": "string" },
+        "terminal_editor": { "type": "string" },
+        "browser": { "type": "string" },
+        "image_viewer": { "type": "string" },
+        "pdf_viewer": { "type": "string" },
+        "video_player": { "type": "string" },
+        "audio_player": { "type": "string" },
+        "archive": { "type": "string" },
+        "launcher": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "keyboard_shortcuts": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z0-9]+(?:_[a-z0-9]+)*$": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
     "hyprland": {
       "type": "object",
       "properties": {

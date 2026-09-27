@@ -15,16 +15,17 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-const LOCK_FILE: &str = ".config.lock";
-const BACKUP_SUFFIX: &str = ".bak";
+const LOCK_FILE: &str = "data/internal/config.lock";
+const BACKUP_FILE: &str = "data/backups/config.json.bak";
 
-const KNOWN_SECTIONS: [&str; 12] = [
+const KNOWN_SECTIONS: [&str; 13] = [
     "appearance",
     "layout",
     "effects",
     "fonts",
     "control_panel",
-    "defaults",
+    "default_apps",
+    "keyboard_shortcuts",
     "hyprland",
     "displays",
     "power",
@@ -88,7 +89,8 @@ impl ConfigScope {
                 "effects",
                 "fonts",
                 "control_panel",
-                "defaults",
+                "default_apps",
+                "keyboard_shortcuts",
                 "hyprland",
                 "displays",
                 "power",
@@ -106,7 +108,8 @@ impl ConfigDocument {
             return Ok(Self::default());
         }
         let text = fs::read_to_string(path)?;
-        let document: Self = serde_json::from_str(&text)?;
+        let mut document: Self = serde_json::from_str(&text)?;
+        migrate_legacy_sections(&mut document)?;
         document.validate()?;
         Ok(document)
     }
@@ -141,7 +144,8 @@ impl ConfigDocument {
         validate_hyprland(self)?;
         validate_displays(self)?;
         validate_control_panel(self)?;
-        validate_defaults(self)?;
+        validate_default_apps(self)?;
+        validate_keyboard_shortcuts(self)?;
         validate_power(self)?;
         validate_session(self)?;
         Ok(())
@@ -270,16 +274,15 @@ impl ConfigStore {
             ConfigDocument::default()
         };
         let before = document.clone();
-        if was_missing {
-            let root = self
-                .path
-                .parent()
-                .ok_or(ConfigError::MissingConfigDirectory)?;
-            import_legacy_values(&mut document, root)?;
-        }
+        let root = self
+            .path
+            .parent()
+            .ok_or(ConfigError::MissingConfigDirectory)?;
+        let imported = import_legacy_values(&mut document, root)?;
+        let moved = migrate_legacy_layout(root)?;
         apply_defaults(&mut document);
         document.validate()?;
-        if document != before {
+        if document != before || imported || moved || was_missing {
             self.save_locked(&document)?;
         }
         Ok(document)
@@ -299,6 +302,9 @@ impl ConfigStore {
             .parent()
             .ok_or(ConfigError::MissingConfigDirectory)?;
         fs::create_dir_all(directory)?;
+        if let Some(lock_parent) = self.lock_path.parent() {
+            fs::create_dir_all(lock_parent)?;
+        }
         Ok(OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -314,10 +320,11 @@ impl ConfigStore {
             .ok_or(ConfigError::MissingConfigDirectory)?;
         fs::create_dir_all(directory)?;
         if self.path.exists() {
-            fs::copy(
-                &self.path,
-                self.path.with_extension(format!("json{BACKUP_SUFFIX}")),
-            )?;
+            let backup = directory.join(BACKUP_FILE);
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&self.path, backup)?;
         }
         let temporary = self
             .path
@@ -413,8 +420,11 @@ impl ConfigStore {
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
         let mut document = self.load()?;
+        let before = document.clone();
         if operation(&mut document)? {
-            self.save_locked(&document)?;
+            if document != before {
+                self.save_locked(&document)?;
+            }
         }
         Ok(document)
     }
@@ -424,7 +434,9 @@ impl ConfigStore {
             .path
             .parent()
             .ok_or(ConfigError::MissingConfigDirectory)?;
-        self.modify_if_changed(|document| import_legacy_values(document, root))
+        let result = self.modify_if_changed(|document| import_legacy_values(document, root));
+        migrate_legacy_layout(root)?;
+        result
     }
 }
 
@@ -449,6 +461,7 @@ fn import_legacy_values(document: &mut ConfigDocument, root: &Path) -> ConfigRes
     changed |= import_hyprland(document, root)?;
     changed |= import_displays(document, root)?;
     changed |= import_defaults(document, &root.join("defaults.json"))?;
+    changed |= import_keyboard_shortcuts(document, root)?;
     changed |= import_language(document, &root.join("language"))?;
     changed |= import_power(document, root)?;
     changed |= import_removable_devices(document, root)?;
@@ -516,8 +529,17 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .or_insert_with(|| Value::Object(Map::new()));
     let object = appearance.as_object_mut().expect("appearance is object");
     object
+        .entry("accent")
+        .or_insert_with(|| Value::String("#3590BD".into()));
+    object
+        .entry("accent_custom")
+        .or_insert_with(|| Value::Bool(false));
+    object
         .entry("theme")
-        .or_insert_with(|| Value::String("argvus-dark".into()));
+        .or_insert_with(|| Value::String("argvus-dark-float".into()));
+    object
+        .entry("wallpaper")
+        .or_insert_with(|| Value::String("/usr/share/backgrounds/argvus/argvus-dark.jxl".into()));
     object
         .entry("gtk_mode")
         .or_insert_with(|| Value::String("dark".into()));
@@ -560,6 +582,90 @@ fn apply_defaults(document: &mut ConfigDocument) {
     effects
         .entry("blur_control-center_enabled")
         .or_insert_with(|| Value::Bool(true));
+
+    let default_apps = document
+        .sections
+        .entry("default_apps".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let default_apps = default_apps
+        .as_object_mut()
+        .expect("default_apps is object");
+    for (category, application) in [
+        ("terminal", "argvus-terminal"),
+        ("file_manager", "spf"),
+        ("text_editor", "mousepad"),
+        ("terminal_editor", "vim"),
+        ("browser", "firefox"),
+        ("image_viewer", "imv"),
+        ("pdf_viewer", "zathura"),
+        ("video_player", "mpv"),
+        ("audio_player", "audacious"),
+        ("archive", "xarchiver"),
+        ("launcher", "rofi"),
+    ] {
+        default_apps
+            .entry(category)
+            .or_insert_with(|| Value::String(application.into()));
+    }
+
+    let keyboard_shortcuts = document
+        .sections
+        .entry("keyboard_shortcuts".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let keyboard_shortcuts = keyboard_shortcuts
+        .as_object_mut()
+        .expect("keyboard_shortcuts is object");
+    for (config_key, shortcut) in manifest_shortcut_defaults() {
+        keyboard_shortcuts.entry(config_key).or_insert(shortcut);
+    }
+
+    let hyprland = document
+        .sections
+        .entry("hyprland".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hyprland = hyprland.as_object_mut().expect("hyprland is object");
+    let input = hyprland
+        .entry("input")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let input = input.as_object_mut().expect("hyprland.input is object");
+    let mouse = input
+        .entry("mouse")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let mouse = mouse
+        .as_object_mut()
+        .expect("hyprland.input.mouse is object");
+    for (key, value) in [
+        ("accel_profile", Value::String("flat".into())),
+        ("left_handed", Value::Bool(false)),
+        ("natural_scroll", Value::Bool(false)),
+        ("scroll_factor", Value::from(1.0)),
+        ("sensitivity", Value::from(0.0)),
+    ] {
+        mouse.entry(key).or_insert(value);
+    }
+    let touchpad = input
+        .entry("touchpad")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let touchpad = touchpad
+        .as_object_mut()
+        .expect("hyprland.input.touchpad is object");
+    for (key, value) in [
+        ("disable_while_typing", Value::Bool(true)),
+        ("natural_scroll", Value::Bool(false)),
+        ("tap_and_drag", Value::Bool(true)),
+        ("tap_to_click", Value::Bool(true)),
+        ("two_finger_right_click", Value::Bool(false)),
+    ] {
+        touchpad.entry(key).or_insert(value);
+    }
+
+    let power = document
+        .sections
+        .entry("power".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let power = power.as_object_mut().expect("power is object");
+    power.entry("lock_minutes").or_insert(15.into());
+    power.entry("screen_off_minutes").or_insert(30.into());
 }
 
 fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
@@ -744,11 +850,60 @@ fn validate_displays(document: &ConfigDocument) -> ConfigResult<()> {
     Ok(())
 }
 
-fn validate_defaults(document: &ConfigDocument) -> ConfigResult<()> {
-    if let Some(value) = document.sections.get("defaults")
-        && !value.is_object()
-    {
-        return Err(ConfigError::Invalid("defaults must be an object".into()));
+fn validate_default_apps(document: &ConfigDocument) -> ConfigResult<()> {
+    if let Some(value) = document.sections.get("default_apps") {
+        let object = value
+            .as_object()
+            .ok_or_else(|| ConfigError::Invalid("default_apps must be an object".into()))?;
+        const CATEGORIES: [&str; 11] = [
+            "terminal",
+            "file_manager",
+            "text_editor",
+            "terminal_editor",
+            "browser",
+            "image_viewer",
+            "pdf_viewer",
+            "video_player",
+            "audio_player",
+            "archive",
+            "launcher",
+        ];
+        for (category, application) in object {
+            if !CATEGORIES.contains(&category.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "default_apps contains unknown category: {category}"
+                )));
+            }
+            if !application.is_string() {
+                return Err(ConfigError::Invalid(format!(
+                    "default_apps.{category} must be a string"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_keyboard_shortcuts(document: &ConfigDocument) -> ConfigResult<()> {
+    let Some(value) = document.sections.get("keyboard_shortcuts") else {
+        return Ok(());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| ConfigError::Invalid("keyboard_shortcuts must be an object".into()))?;
+    for (key, shortcut) in object {
+        if !key.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        }) {
+            return Err(ConfigError::Invalid(format!(
+                "keyboard_shortcuts.{key} is not a stable config key"
+            )));
+        }
+        if !shortcut.is_null() && !shortcut.is_string() {
+            return Err(ConfigError::Invalid(format!(
+                "keyboard_shortcuts.{key} must be a string or null"
+            )));
+        }
     }
     Ok(())
 }
@@ -940,18 +1095,198 @@ fn import_fonts(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool
 }
 
 fn import_defaults(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
-    if document.get("/defaults").is_some() {
+    if document.get("/default_apps").is_some() {
         return Ok(false);
     }
     let Ok(contents) = fs::read_to_string(path) else {
         return Ok(false);
     };
     let value: Value = serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
-    if !value.is_object() {
+    let Some(object) = value.as_object() else {
+        return Ok(false);
+    };
+    const CATEGORIES: [&str; 11] = [
+        "terminal",
+        "file_manager",
+        "text_editor",
+        "terminal_editor",
+        "browser",
+        "image_viewer",
+        "pdf_viewer",
+        "video_player",
+        "audio_player",
+        "archive",
+        "launcher",
+    ];
+    let migrated = object
+        .iter()
+        .filter(|(key, value)| CATEGORIES.contains(&key.as_str()) && value.is_string())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    document.set("/default_apps", Value::Object(migrated))?;
+    Ok(true)
+}
+
+fn import_keyboard_shortcuts(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
+    if document.get("/keyboard_shortcuts").is_some() {
         return Ok(false);
     }
-    document.set("/defaults", value)?;
+    let old_value = if let Some(value) = document.get("/hyprland/keybindings") {
+        Some(value.clone())
+    } else {
+        parse_keybindings_toml(&root.join("keybindings.toml"))?
+    };
+    let Some(value) = old_value else {
+        return Ok(false);
+    };
+    let shortcuts = legacy_keybindings_to_shortcuts(&value);
+    document.set("/keyboard_shortcuts", shortcuts)?;
+    document.unset("/hyprland/keybindings")?;
     Ok(true)
+}
+
+fn migrate_legacy_sections(document: &mut ConfigDocument) -> ConfigResult<()> {
+    if document.get("/default_apps").is_none()
+        && let Some(value) = document.sections.remove("defaults")
+    {
+        document.set("/default_apps", value)?;
+    } else {
+        document.sections.remove("defaults");
+    }
+    if document.get("/keyboard_shortcuts").is_none()
+        && let Some(value) = document
+            .sections
+            .get_mut("hyprland")
+            .and_then(Value::as_object_mut)
+            .and_then(|object| object.remove("keybindings"))
+    {
+        document.set(
+            "/keyboard_shortcuts",
+            legacy_keybindings_to_shortcuts(&value),
+        )?;
+    }
+    if let Some(hyprland) = document.sections.get_mut("hyprland") {
+        hyprland
+            .as_object_mut()
+            .expect("hyprland is object")
+            .remove("keybindings");
+    }
+    Ok(())
+}
+
+fn legacy_keybindings_to_shortcuts(value: &Value) -> Value {
+    let mut shortcuts = Map::new();
+    if let Some(entries) = value.as_object() {
+        for (id, binding) in entries {
+            let config_key = config_key_for_binding(id);
+            let shortcut = binding
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .filter(|enabled| !enabled)
+                .map(|_| Value::Null)
+                .or_else(|| binding.get("keys").cloned())
+                .unwrap_or(Value::Null);
+            shortcuts.insert(config_key, shortcut);
+        }
+    }
+    Value::Object(shortcuts)
+}
+
+fn config_key_for_binding(id: &str) -> String {
+    match id {
+        "window.close" => "close_window",
+        "window.drag_mouse" => "drag_window__floating_window_only",
+        "window.maximize" => "maximize_window__toggle",
+        "app.browser" => "open_browser",
+        "system.about" => "open_about",
+        "appearance.theme" => "open_theme_selector",
+        _ => return id.replace('.', "_").replace('-', "_"),
+    }
+    .into()
+}
+
+fn manifest_shortcut_defaults() -> BTreeMap<String, Value> {
+    let path = env::var_os("ARGVUS_SYSTEM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/argvus"))
+        .join("hyprland/keybindings.json");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&contents) else {
+        return BTreeMap::new();
+    };
+    let mut defaults = BTreeMap::new();
+    let Some(bindings) = manifest.get("bindings").and_then(Value::as_array) else {
+        return defaults;
+    };
+    for binding in bindings {
+        let Some(id) = binding.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = binding
+            .get("config_key")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| config_key_for_binding(id));
+        if let Some(shortcut) = binding.get("keys") {
+            defaults.insert(key, shortcut.clone());
+        }
+    }
+    defaults
+}
+
+fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
+    let data = root.join("data");
+    fs::create_dir_all(data.join("internal"))?;
+    fs::create_dir_all(data.join("backups"))?;
+    let mut moved = false;
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, io::Error>>()?;
+    entries.sort_by_key(|entry| {
+        if entry.file_name() == "generated" {
+            0
+        } else {
+            1
+        }
+    });
+    for entry in entries {
+        let source = entry.path();
+        let name = entry.file_name();
+        if name == "config.json" || name == "data" {
+            continue;
+        }
+        let name = name.to_string_lossy();
+        let relative = match name.as_ref() {
+            ".config.lock" => PathBuf::from("data/internal/config.lock"),
+            "config.json.bak" => PathBuf::from("data/backups/config.json.bak"),
+            "defaults.json" => PathBuf::from("data/control-center/defaults.json"),
+            "keybindings.toml" => PathBuf::from("data/hypr/keybindings.toml"),
+            "input.toml" => PathBuf::from("data/hypr/input.toml"),
+            "fonts.conf" => PathBuf::from("data/generated/fonts.conf"),
+            "generated" => PathBuf::from("data/generated"),
+            "state" => PathBuf::from("data/state"),
+            "hypr" => PathBuf::from("data/hypr"),
+            "waybar" => PathBuf::from("data/taskbar/waybar"),
+            "rofi" => PathBuf::from("data/launcher/rofi"),
+            "quickshell" => PathBuf::from("data/control-panel/quickshell"),
+            "terminal" | "kitty" | "foot" => PathBuf::from(format!("data/terminal/{name}")),
+            _ => PathBuf::from(format!("data/legacy/{name}")),
+        };
+        let destination = root.join(relative);
+        if destination.exists() {
+            let fallback = root.join("data/legacy").join(name.as_ref());
+            if fallback.exists() {
+                continue;
+            }
+            fs::create_dir_all(fallback.parent().expect("legacy parent"))?;
+            fs::rename(&source, fallback)?;
+        } else {
+            fs::create_dir_all(destination.parent().expect("migration parent"))?;
+            fs::rename(&source, destination)?;
+        }
+        moved = true;
+    }
+    Ok(moved)
 }
 
 fn import_language(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
@@ -1070,12 +1405,6 @@ fn strip_json_comments(contents: &str) -> String {
 
 fn import_hyprland(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
     let mut changed = false;
-    if document.get("/hyprland/keybindings").is_none()
-        && let Some(value) = parse_keybindings_toml(&root.join("keybindings.toml"))?
-    {
-        document.set("/hyprland/keybindings", value)?;
-        changed = true;
-    }
     if document.get("/hyprland/input").is_none()
         && let Some(value) = parse_input_toml(&root.join("input.toml"))?
     {
@@ -1355,7 +1684,7 @@ mod tests {
             .set("/appearance/theme", Value::String("argvus-dark".into()))
             .unwrap();
         document
-            .set("/defaults/browser", Value::String("firefox".into()))
+            .set("/default_apps/browser", Value::String("firefox".into()))
             .unwrap();
         let scoped = document.scoped(ConfigScope::Appearance);
         assert!(scoped.sections.contains_key("appearance"));
@@ -1444,7 +1773,7 @@ mod tests {
         );
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
-            Some("argvus-dark")
+            Some("argvus-dark-float")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1471,7 +1800,8 @@ mod tests {
             .unwrap();
         store.save(&second).unwrap();
 
-        let backup = fs::read_to_string(store.path.with_extension("json.bak")).unwrap();
+        let backup =
+            fs::read_to_string(config_directory.join("data/backups/config.json.bak")).unwrap();
         let backup_document: ConfigDocument = serde_json::from_str(&backup).unwrap();
         assert_eq!(
             backup_document
@@ -1590,7 +1920,7 @@ mod tests {
         let document = store.load().unwrap();
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
-            Some("argvus-dark")
+            Some("argvus-dark-float")
         );
         assert_eq!(
             document.get("/effects/animations"),

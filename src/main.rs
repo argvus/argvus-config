@@ -3,7 +3,6 @@ use serde_json::{Map, Value};
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -43,45 +42,13 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
         "export" => export_scope(&store, &arguments[1..])?,
         "import" => import_scope(&store, &arguments[1..])?,
-        "project" => project_config(
+        "project" => argvus_config_core::project::project(
             &store,
             arguments.iter().any(|argument| argument == "--force"),
-        )?,
+        )
+        .map(|message| println!("{message}"))?,
         "help" | "--help" | "-h" => print_help(),
         other => return Err(format!("unknown command: {other}").into()),
-    }
-    Ok(())
-}
-
-fn project_config(store: &ConfigStore, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Projection is a materialization boundary.  Always ensure the canonical
-    // document first so a fresh profile receives the persisted defaults before
-    // any consumer reads it.  The projection helper must never infer user
-    // preferences from missing generated/state files.
-    store.ensure()?;
-    let system_config = env::var_os("ARGVUS_SYSTEM_CONFIG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/usr/share/argvus".into());
-    let script = system_config.join("session/sh/project-config.sh");
-    if !script.is_file() {
-        return Err(format!("projection helper not found: {}", script.display()).into());
-    }
-    let config_home = store
-        .path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("invalid canonical configuration path")?;
-    let mut command = Command::new("sh");
-    command
-        .arg(&script)
-        .env("ARGVUS_CONFIG_HOME", config_home)
-        .env("ARGVUS_SYSTEM_CONFIG", &system_config);
-    if force {
-        command.env("ARGVUS_PROJECT_FORCE", "1");
-    }
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("projection helper exited with {status}").into());
     }
     Ok(())
 }

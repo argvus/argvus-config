@@ -14,6 +14,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub mod project;
+
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const LOCK_FILE: &str = "data/internal/config.lock";
 const BACKUP_FILE: &str = "data/backups/config.json.bak";
@@ -390,10 +392,8 @@ impl ConfigStore {
                 .get("/appearance/wallpaper_custom")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if !wallpaper_custom {
-                if let Some(wallpaper) = wallpaper {
-                    document.set("/appearance/wallpaper", Value::String(wallpaper.to_owned()))?;
-                }
+            if !wallpaper_custom && let Some(wallpaper) = wallpaper {
+                document.set("/appearance/wallpaper", Value::String(wallpaper.to_owned()))?;
             }
             Ok(())
         })
@@ -421,10 +421,8 @@ impl ConfigStore {
         let _lock_guard = LockGuard(&lock);
         let mut document = self.load()?;
         let before = document.clone();
-        if operation(&mut document)? {
-            if document != before {
-                self.save_locked(&document)?;
-            }
+        if operation(&mut document)? && document != before {
+            self.save_locked(&document)?;
         }
         Ok(document)
     }
@@ -1200,7 +1198,7 @@ fn config_key_for_binding(id: &str) -> String {
         "app.browser" => "open_browser",
         "system.about" => "open_about",
         "appearance.theme" => "open_theme_selector",
-        _ => return id.replace('.', "_").replace('-', "_"),
+        _ => return id.replace(['.', '-'], "_"),
     }
     .into()
 }

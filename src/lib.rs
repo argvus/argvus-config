@@ -343,6 +343,55 @@ impl ConfigStore {
         self.modify(|document| document.unset(pointer))
     }
 
+    /// Apply a complete JSON patch under one canonical lock. The patch object
+    /// maps JSON pointers to their replacement values; `null` is a real JSON
+    /// value and is therefore never treated as an implicit deletion.
+    pub fn patch(&self, values: &Map<String, Value>) -> ConfigResult<ConfigDocument> {
+        self.modify(|document| {
+            for (pointer, value) in values {
+                document.set(pointer, value.clone())?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically apply the theme-owned appearance fields while preserving
+    /// explicit user overrides recorded in the canonical document.
+    pub fn apply_theme(
+        &self,
+        theme: &str,
+        accent: Option<&str>,
+        gtk_mode: Option<&str>,
+        wallpaper: Option<&str>,
+    ) -> ConfigResult<ConfigDocument> {
+        self.modify(|document| {
+            document.set("/appearance/theme", Value::String(theme.to_owned()))?;
+            let accent_custom = document
+                .get("/appearance/accent_custom")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !accent_custom {
+                if let Some(accent) = accent {
+                    document.set("/appearance/accent", Value::String(accent.to_owned()))?;
+                }
+                document.set("/appearance/accent_custom", Value::Bool(false))?;
+            }
+            if let Some(mode) = gtk_mode {
+                document.set("/appearance/gtk_mode", Value::String(mode.to_owned()))?;
+            }
+            let wallpaper_custom = document
+                .get("/appearance/wallpaper_custom")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !wallpaper_custom {
+                if let Some(wallpaper) = wallpaper {
+                    document.set("/appearance/wallpaper", Value::String(wallpaper.to_owned()))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Perform a read-modify-write transaction under the same lock used by
     /// `save`. Callers must use this for every canonical mutation so two UI
     /// processes cannot overwrite each other's sections with stale documents.
@@ -542,6 +591,13 @@ fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
         return Err(ConfigError::Invalid(
             "appearance.accent_custom must be a boolean".into(),
         ));
+    }
+    for key in ["wallpaper_custom"] {
+        if object.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(ConfigError::Invalid(format!(
+                "appearance.{key} must be a boolean"
+            )));
+        }
     }
     if let Some(mode) = object.get("gtk_mode")
         && !mode
@@ -1581,6 +1637,52 @@ mod tests {
 
         assert!(store.ensure().is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "{ invalid\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_theme_is_one_transaction_and_preserves_explicit_overrides() {
+        let directory =
+            env::temp_dir().join(format!("argvus-config-test-{}-theme", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+        store.ensure().unwrap();
+        let mut patch = Map::new();
+        patch.insert("/appearance/accent".into(), Value::String("#ABCDEF".into()));
+        patch.insert("/appearance/accent_custom".into(), Value::Bool(true));
+        patch.insert(
+            "/appearance/wallpaper".into(),
+            Value::String("/tmp/custom.jxl".into()),
+        );
+        patch.insert("/appearance/wallpaper_custom".into(), Value::Bool(true));
+        store.patch(&patch).unwrap();
+        store
+            .apply_theme(
+                "universe",
+                Some("#EEEEEE"),
+                Some("dark"),
+                Some("/usr/share/backgrounds/universe.jxl"),
+            )
+            .unwrap();
+        let document = store.load().unwrap();
+        assert_eq!(
+            document.get("/appearance/theme").and_then(Value::as_str),
+            Some("universe")
+        );
+        assert_eq!(
+            document.get("/appearance/accent").and_then(Value::as_str),
+            Some("#ABCDEF")
+        );
+        assert_eq!(
+            document
+                .get("/appearance/wallpaper")
+                .and_then(Value::as_str),
+            Some("/tmp/custom.jxl")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

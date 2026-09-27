@@ -1,5 +1,5 @@
 use argvus_config_core::{ConfigDocument, ConfigScope, ConfigStore};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -35,6 +35,8 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
         "get" => get_value(&store, &arguments[1..])?,
         "set" => set_value(&store, &arguments[1..])?,
+        "patch" => patch_value(&store, &arguments[1..])?,
+        "apply-theme" => apply_theme(&store, &arguments[1..])?,
         "unset" => {
             let pointer = arguments.get(1).ok_or("usage: argvus-config unset /path")?;
             store.unset(pointer)?;
@@ -52,6 +54,11 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn project_config(store: &ConfigStore, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Projection is a materialization boundary.  Always ensure the canonical
+    // document first so a fresh profile receives the persisted defaults before
+    // any consumer reads it.  The projection helper must never infer user
+    // preferences from missing generated/state files.
+    store.ensure()?;
     let system_config = env::var_os("ARGVUS_SYSTEM_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "/usr/share/argvus".into());
@@ -112,6 +119,68 @@ fn set_value(store: &ConfigStore, arguments: &[String]) -> Result<(), Box<dyn st
         serde_json::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.clone()));
     store.update(pointer, value)?;
     Ok(())
+}
+
+fn patch_value(
+    store: &ConfigStore,
+    arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = arguments
+        .first()
+        .ok_or("usage: argvus-config patch FILE|- [JSON]")?;
+    let text = if input == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else if input.starts_with('{') {
+        input.clone()
+    } else {
+        fs::read_to_string(input)?
+    };
+    let values: Map<String, Value> = serde_json::from_str(&text)?;
+    store.patch(&values)?;
+    Ok(())
+}
+
+fn apply_theme(
+    store: &ConfigStore,
+    arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let theme = arguments.first().ok_or("usage: argvus-config apply-theme THEME [--accent HEX] [--gtk-mode MODE] [--wallpaper PATH]")?;
+    let option = |name: &str| {
+        arguments
+            .iter()
+            .position(|value| value == name)
+            .and_then(|index| arguments.get(index + 1))
+    };
+    let manifest = load_theme_manifest(theme)?;
+    let accent = option("--accent")
+        .map(String::as_str)
+        .or_else(|| manifest.get("accent").and_then(Value::as_str));
+    let gtk_mode = option("--gtk-mode")
+        .map(String::as_str)
+        .or_else(|| manifest.get("mode").and_then(Value::as_str));
+    store.apply_theme(
+        theme,
+        accent,
+        gtk_mode,
+        option("--wallpaper").map(String::as_str),
+    )?;
+    Ok(())
+}
+
+fn load_theme_manifest(theme: &str) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
+    let system_config = env::var_os("ARGVUS_SYSTEM_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/usr/share/argvus".into());
+    let path = system_config.join("appearance/config/theme-defaults.json");
+    if !path.is_file() {
+        return Ok(Map::new());
+    }
+    let document: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    Ok(document
+        .get(theme)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default())
 }
 
 fn export_scope(
@@ -175,11 +244,13 @@ fn import_scope(
 
 fn print_help() {
     println!(
-        "argvus-config path|validate|ensure|migrate|get|set|unset|export|import|project [--force]"
+        "argvus-config path|validate|ensure|migrate|get|set|patch|apply-theme|unset|export|import|project [--force]"
     );
     println!("  ensure  materialize canonical defaults without resetting explicit values");
     println!("  get /appearance/theme [--effective] [--raw]");
     println!("  set /appearance/theme \"argvus-dark\"");
+    println!("  patch FILE|-                         atomically update multiple JSON pointers");
+    println!("  apply-theme THEME [theme options]     atomically apply theme-owned fields");
     println!("  export --scope appearance|desktop [--output FILE]");
     println!("  import --scope appearance|desktop FILE");
     println!("  project  incrementally generate native and generated files from config.json");

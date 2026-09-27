@@ -5,9 +5,77 @@
   "required": ["schema_version"],
   "properties": {
     "schema_version": { "type": "integer", "const": 1 },
-    "appearance": { "type": "object" },
-    "layout": { "type": "object" },
-    "effects": { "type": "object" },
+    "appearance": {
+      "type": "object",
+      "properties": {
+        "theme": { "type": "string", "minLength": 1 },
+        "accent": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "accent_custom": { "type": "boolean" },
+        "gtk_mode": { "enum": ["light", "dark", "auto", "sticky"] },
+        "wallpaper": { "type": ["string", "null"] },
+        "wallpaper_custom": { "type": "boolean" },
+        "colors": {
+          "type": "object",
+          "properties": {
+            "window_border_active": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "window_border_inactive": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "group_border_active": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "group_border_inactive": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "taskbar_border": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" }
+          }
+        }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "variant": { "enum": ["sticky", "float"] },
+        "window": {
+          "type": "object",
+          "properties": {
+            "gaps_in": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "gaps_out": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "border_size": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "rounding": { "type": "integer", "minimum": 0, "maximum": 50 }
+          }
+        },
+        "taskbar": {
+          "type": "object",
+          "properties": {
+            "position": { "enum": ["top", "bottom", "left", "right"] },
+            "margin_top": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "margin_bottom": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "margin_left": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "margin_right": { "type": "integer", "minimum": 0, "maximum": 100 }
+          }
+        }
+      }
+    },
+    "effects": {
+      "type": "object",
+      "properties": {
+        "animations": { "type": "boolean" },
+        "blur_global_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "transparency_taskbar_enabled": { "type": "boolean" },
+        "transparency_taskbar_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_taskbar_enabled": { "type": "boolean" },
+        "transparency_launchers_enabled": { "type": "boolean" },
+        "transparency_launchers_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_launchers_enabled": { "type": "boolean" },
+        "transparency_widget-telemetry_enabled": { "type": "boolean" },
+        "transparency_widget-telemetry_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_widget-telemetry_enabled": { "type": "boolean" },
+        "transparency_control-panel_enabled": { "type": "boolean" },
+        "transparency_control-panel_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_control-panel_enabled": { "type": "boolean" },
+        "transparency_terminal_enabled": { "type": "boolean" },
+        "transparency_terminal_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_terminal_enabled": { "type": "boolean" },
+        "transparency_control-center_enabled": { "type": "boolean" },
+        "transparency_control-center_value": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "blur_control-center_enabled": { "type": "boolean" }
+      }
+    },
     "fonts": {
       "type": "object",
       "properties": {

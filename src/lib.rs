@@ -257,6 +257,26 @@ impl ConfigStore {
         ConfigDocument::load_effective(&self.path)
     }
 
+    /// Create or complete the canonical document without replacing explicit
+    /// values. This is the only initialization path used by session recovery.
+    pub fn ensure(&self) -> ConfigResult<ConfigDocument> {
+        let lock = self.open_lock()?;
+        lock_file(&lock)?;
+        let _lock_guard = LockGuard(&lock);
+        let mut document = if self.path.exists() {
+            self.load()?
+        } else {
+            ConfigDocument::default()
+        };
+        let before = document.clone();
+        apply_defaults(&mut document);
+        document.validate()?;
+        if document != before {
+            self.save_locked(&document)?;
+        }
+        Ok(document)
+    }
+
     pub fn save(&self, document: &ConfigDocument) -> ConfigResult<()> {
         document.validate()?;
         let lock = self.open_lock()?;
@@ -312,7 +332,13 @@ impl ConfigStore {
     }
 
     pub fn unset(&self, pointer: &str) -> ConfigResult<ConfigDocument> {
-        self.modify(|document| document.unset(pointer))
+        let document = self.modify(|document| document.unset(pointer))?;
+        if pointer == "/appearance/theme" {
+            let _ = fs::remove_file(self.path.with_file_name(".active-theme"));
+        } else if pointer == "/appearance/accent" {
+            let _ = fs::remove_file(self.path.with_file_name(".accent-color"));
+        }
+        Ok(document)
     }
 
     /// Perform a read-modify-write transaction under the same lock used by
@@ -1440,5 +1466,77 @@ mod tests {
             Some(&Value::Number(80.into()))
         );
         let _ = fs::remove_file(existing_path);
+    }
+
+    #[test]
+    fn ensure_materializes_defaults_and_preserves_explicit_false_and_zero() {
+        let directory =
+            env::temp_dir().join(format!("argvus-config-test-{}-ensure", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+
+        store.ensure().unwrap();
+        assert!(store.path.is_file());
+        let document = store.load().unwrap();
+        assert_eq!(
+            document.get("/appearance/theme").and_then(Value::as_str),
+            Some("argvus-dark")
+        );
+        assert_eq!(
+            document.get("/effects/animations"),
+            Some(&Value::Bool(true))
+        );
+
+        store
+            .set_explicit_for_test("/effects/animations", Value::Bool(false))
+            .unwrap();
+        store
+            .set_explicit_for_test(
+                "/effects/transparency_terminal_value",
+                Value::Number(0.into()),
+            )
+            .unwrap();
+        store.ensure().unwrap();
+        let preserved = store.load().unwrap();
+        assert_eq!(
+            preserved.get("/effects/animations"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            preserved.get("/effects/transparency_terminal_value"),
+            Some(&Value::Number(0.into()))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ensure_does_not_replace_malformed_configuration() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-malformed",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        fs::create_dir_all(&config_directory).unwrap();
+        let path = config_directory.join("config.json");
+        fs::write(&path, b"{ invalid\n").unwrap();
+        let store = ConfigStore {
+            path: path.clone(),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+
+        assert!(store.ensure().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "{ invalid\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    impl ConfigStore {
+        fn set_explicit_for_test(&self, pointer: &str, value: Value) -> ConfigResult<()> {
+            self.update(pointer, value).map(|_| ())
+        }
     }
 }

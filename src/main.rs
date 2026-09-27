@@ -25,6 +25,10 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             store.load()?.validate()?;
             println!("valid");
         }
+        "ensure" | "init" => {
+            store.ensure()?;
+            println!("ready");
+        }
         "migrate" => {
             store.migrate_legacy()?;
             println!("migrated");
@@ -170,7 +174,10 @@ fn import_scope(
 }
 
 fn print_help() {
-    println!("argvus-config path|validate|migrate|get|set|unset|export|import|project [--force]");
+    println!(
+        "argvus-config path|validate|ensure|migrate|get|set|unset|export|import|project [--force]"
+    );
+    println!("  ensure  materialize canonical defaults without resetting explicit values");
     println!("  get /appearance/theme [--effective] [--raw]");
     println!("  set /appearance/theme \"argvus-dark\"");
     println!("  export --scope appearance|desktop [--output FILE]");

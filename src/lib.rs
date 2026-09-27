@@ -263,12 +263,20 @@ impl ConfigStore {
         let lock = self.open_lock()?;
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
-        let mut document = if self.path.exists() {
+        let was_missing = !self.path.exists();
+        let mut document = if !was_missing {
             self.load()?
         } else {
             ConfigDocument::default()
         };
         let before = document.clone();
+        if was_missing {
+            let root = self
+                .path
+                .parent()
+                .ok_or(ConfigError::MissingConfigDirectory)?;
+            import_legacy_values(&mut document, root)?;
+        }
         apply_defaults(&mut document);
         document.validate()?;
         if document != before {
@@ -332,13 +340,7 @@ impl ConfigStore {
     }
 
     pub fn unset(&self, pointer: &str) -> ConfigResult<ConfigDocument> {
-        let document = self.modify(|document| document.unset(pointer))?;
-        if pointer == "/appearance/theme" {
-            let _ = fs::remove_file(self.path.with_file_name(".active-theme"));
-        } else if pointer == "/appearance/accent" {
-            let _ = fs::remove_file(self.path.with_file_name(".accent-color"));
-        }
-        Ok(document)
+        self.modify(|document| document.unset(pointer))
     }
 
     /// Perform a read-modify-write transaction under the same lock used by
@@ -373,28 +375,35 @@ impl ConfigStore {
             .path
             .parent()
             .ok_or(ConfigError::MissingConfigDirectory)?;
-        self.modify_if_changed(|document| {
-            let mut changed = false;
-            changed |= import_line(document, "/appearance/theme", &root.join(".active-theme"))?;
-            changed |= import_line(document, "/appearance/accent", &root.join(".accent-color"))?;
-            changed |= import_line(document, "/appearance/gtk_mode", &root.join(".gtk-mode"))?;
-            changed |= import_line(
-                document,
-                "/appearance/wallpaper",
-                &root.join(".wallpaper-custom"),
-            )?;
-            changed |= import_raw(document, "/layout/spaces_legacy", &root.join(".spaces"))?;
-            changed |= import_raw(document, "/layout/borders_legacy", &root.join(".borders"))?;
-            changed |= import_fonts(document, &root.join("fonts.conf"))?;
-            changed |= import_hyprland(document, root)?;
-            changed |= import_displays(document, root)?;
-            changed |= import_defaults(document, &root.join("defaults.json"))?;
-            changed |= import_language(document, &root.join("language"))?;
-            changed |= import_power(document, root)?;
-            changed |= import_removable_devices(document, root)?;
-            Ok(changed)
-        })
+        self.modify_if_changed(|document| import_legacy_values(document, root))
     }
+}
+
+fn import_legacy_values(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
+    let mut changed = false;
+    changed |= import_line(document, "/appearance/theme", &root.join(".active-theme"))?;
+    let imported_accent = import_line(document, "/appearance/accent", &root.join(".accent-color"))?;
+    changed |= imported_accent;
+    if imported_accent && root.join(".accent-custom").is_file() {
+        document.set("/appearance/accent_custom", Value::Bool(true))?;
+        changed = true;
+    }
+    changed |= import_line(document, "/appearance/gtk_mode", &root.join(".gtk-mode"))?;
+    changed |= import_line(
+        document,
+        "/appearance/wallpaper",
+        &root.join(".wallpaper-custom"),
+    )?;
+    changed |= import_raw(document, "/layout/spaces_legacy", &root.join(".spaces"))?;
+    changed |= import_raw(document, "/layout/borders_legacy", &root.join(".borders"))?;
+    changed |= import_fonts(document, &root.join("fonts.conf"))?;
+    changed |= import_hyprland(document, root)?;
+    changed |= import_displays(document, root)?;
+    changed |= import_defaults(document, &root.join("defaults.json"))?;
+    changed |= import_language(document, &root.join("language"))?;
+    changed |= import_power(document, root)?;
+    changed |= import_removable_devices(document, root)?;
+    Ok(changed)
 }
 
 fn default_schema_version() -> u32 {
@@ -526,6 +535,13 @@ fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
                 "appearance.accent must be #RRGGBB".into(),
             ));
         }
+    }
+    if let Some(accent_custom) = object.get("accent_custom")
+        && !accent_custom.is_boolean()
+    {
+        return Err(ConfigError::Invalid(
+            "appearance.accent_custom must be a boolean".into(),
+        ));
     }
     if let Some(mode) = object.get("gtk_mode")
         && !mode
@@ -1339,6 +1355,40 @@ mod tests {
         assert_eq!(
             document.get("/appearance/accent").and_then(Value::as_str),
             Some("#112233")
+        );
+        assert!(document.get("/appearance/accent_custom").is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_migration_marks_only_legacy_explicit_accents() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-accent-marker",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        fs::create_dir_all(&config_directory).unwrap();
+        fs::write(config_directory.join(".accent-color"), "#ABCDEF\n").unwrap();
+        fs::write(config_directory.join(".accent-custom"), "1\n").unwrap();
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+
+        store.ensure().unwrap();
+        let document = store.load().unwrap();
+        assert_eq!(
+            document.get("/appearance/accent").and_then(Value::as_str),
+            Some("#ABCDEF")
+        );
+        assert_eq!(
+            document.get("/appearance/accent_custom"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            document.get("/appearance/theme").and_then(Value::as_str),
+            Some("argvus-dark")
         );
         fs::remove_dir_all(directory).unwrap();
     }

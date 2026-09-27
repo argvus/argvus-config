@@ -1262,8 +1262,10 @@ fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
             "defaults.json" => PathBuf::from("data/control-center/defaults.json"),
             "keybindings.toml" => PathBuf::from("data/hypr/keybindings.toml"),
             "input.toml" => PathBuf::from("data/hypr/input.toml"),
+            ".idle-timeout" | ".keep-awake" => PathBuf::from(format!("data/power/{name}")),
             "fonts.conf" => PathBuf::from("data/generated/fonts.conf"),
             "generated" => PathBuf::from("data/generated"),
+            "control-center" => PathBuf::from("data/control-center"),
             "state" => PathBuf::from("data/state"),
             "hypr" => PathBuf::from("data/hypr"),
             "waybar" => PathBuf::from("data/taskbar/waybar"),
@@ -1273,7 +1275,9 @@ fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
             _ => PathBuf::from(format!("data/legacy/{name}")),
         };
         let destination = root.join(relative);
-        if destination.exists() {
+        if matches!(name.as_ref(), "generated" | "control-center") && source.is_dir() {
+            merge_legacy_tree(&source, &destination, &data.join("legacy"))?;
+        } else if destination.exists() {
             let fallback = root.join("data/legacy").join(name.as_ref());
             if fallback.exists() {
                 continue;
@@ -1287,6 +1291,51 @@ fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
         moved = true;
     }
     Ok(moved)
+}
+
+/// Merge an old component directory into its new data-owned location.
+///
+/// New files win on collision because they are the current layout. Conflicting
+/// legacy files are retained under data/legacy instead of being discarded.
+fn merge_legacy_tree(source: &Path, destination: &Path, legacy_root: &Path) -> ConfigResult<bool> {
+    fs::create_dir_all(destination)?;
+    let component_name = source
+        .file_name()
+        .ok_or_else(|| ConfigError::Invalid("legacy component has no name".into()))?;
+    let component_legacy_root = legacy_root.join(component_name);
+    let mut changed = false;
+
+    for entry in fs::read_dir(source)?.collect::<Result<Vec<_>, io::Error>>()? {
+        let source_entry = entry.path();
+        let entry_name = entry.file_name();
+        let destination_entry = destination.join(&entry_name);
+
+        if destination_entry.is_dir() && source_entry.is_dir() {
+            changed |=
+                merge_legacy_tree(&source_entry, &destination_entry, &component_legacy_root)?;
+            continue;
+        }
+
+        if destination_entry.exists() {
+            fs::create_dir_all(&component_legacy_root)?;
+            let mut legacy_entry = component_legacy_root.join(&entry_name);
+            let mut suffix = 1u32;
+            while legacy_entry.exists() {
+                legacy_entry = component_legacy_root
+                    .join(format!("{}.legacy-{suffix}", entry_name.to_string_lossy()));
+                suffix += 1;
+            }
+            fs::rename(&source_entry, legacy_entry)?;
+        } else {
+            fs::rename(&source_entry, destination_entry)?;
+        }
+        changed = true;
+    }
+
+    if fs::read_dir(source)?.next().is_none() {
+        fs::remove_dir(source)?;
+    }
+    Ok(changed)
 }
 
 fn import_language(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
@@ -1946,6 +1995,69 @@ mod tests {
             preserved.get("/effects/transparency_terminal_value"),
             Some(&Value::Number(0.into()))
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ensure_migrates_component_directories_into_data_idempotently() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-component-migration",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        fs::create_dir_all(config_directory.join("generated")).unwrap();
+        fs::create_dir_all(config_directory.join("control-center")).unwrap();
+        fs::create_dir_all(config_directory.join("data/generated")).unwrap();
+        fs::create_dir_all(config_directory.join("data/control-center")).unwrap();
+        fs::write(
+            config_directory.join("generated/theme-effective.conf"),
+            b"legacy-theme",
+        )
+        .unwrap();
+        fs::write(
+            config_directory.join("control-center/foot.ini"),
+            b"legacy-foot",
+        )
+        .unwrap();
+        fs::write(
+            config_directory.join("data/generated/current.conf"),
+            b"current-generated",
+        )
+        .unwrap();
+        fs::write(
+            config_directory.join("data/control-center/current.ini"),
+            b"current-control-center",
+        )
+        .unwrap();
+
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+        store.ensure().unwrap();
+
+        assert!(!config_directory.join("generated").exists());
+        assert!(!config_directory.join("control-center").exists());
+        assert_eq!(
+            fs::read(config_directory.join("data/generated/theme-effective.conf")).unwrap(),
+            b"legacy-theme"
+        );
+        assert_eq!(
+            fs::read(config_directory.join("data/control-center/foot.ini")).unwrap(),
+            b"legacy-foot"
+        );
+
+        let first_tree = fs::read_dir(config_directory.join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        store.ensure().unwrap();
+        let second_tree = fs::read_dir(config_directory.join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(first_tree, second_tree);
         fs::remove_dir_all(directory).unwrap();
     }
 

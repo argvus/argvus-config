@@ -111,7 +111,7 @@ fn apply_theme(
     store: &ConfigStore,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let theme = arguments.first().ok_or("usage: argvus-config apply-theme THEME [--accent HEX] [--gtk-mode MODE] [--wallpaper PATH]")?;
+    let theme = arguments.first().ok_or("usage: argvus-config apply-theme THEME [--accent HEX] [--gtk-mode MODE] [--wallpaper PATH] [--reset-wallpaper]")?;
     let option = |name: &str| {
         arguments
             .iter()
@@ -130,6 +130,9 @@ fn apply_theme(
         accent,
         gtk_mode,
         option("--wallpaper").map(String::as_str),
+        arguments
+            .iter()
+            .any(|argument| argument == "--reset-wallpaper"),
     )?;
     Ok(())
 }

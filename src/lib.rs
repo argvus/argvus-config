@@ -372,9 +372,14 @@ impl ConfigStore {
         accent: Option<&str>,
         gtk_mode: Option<&str>,
         wallpaper: Option<&str>,
+        reset_custom_wallpaper: bool,
     ) -> ConfigResult<ConfigDocument> {
         self.modify(|document| {
             document.set("/appearance/theme", Value::String(theme.to_owned()))?;
+            document.set(
+                "/layout/variant",
+                Value::String(theme_layout_variant(theme).to_owned()),
+            )?;
             let accent_custom = document
                 .get("/appearance/accent_custom")
                 .and_then(Value::as_bool)
@@ -392,7 +397,12 @@ impl ConfigStore {
                 .get("/appearance/wallpaper_custom")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if !wallpaper_custom && let Some(wallpaper) = wallpaper {
+            if reset_custom_wallpaper {
+                document.set("/appearance/wallpaper_custom", Value::Bool(false))?;
+            }
+            if (reset_custom_wallpaper || !wallpaper_custom)
+                && let Some(wallpaper) = wallpaper
+            {
                 document.set("/appearance/wallpaper", Value::String(wallpaper.to_owned()))?;
             }
             Ok(())
@@ -435,6 +445,14 @@ impl ConfigStore {
         let result = self.modify_if_changed(|document| import_legacy_values(document, root));
         migrate_legacy_layout(root)?;
         result
+    }
+}
+
+fn theme_layout_variant(theme: &str) -> &'static str {
+    if theme.ends_with("-float") {
+        "float"
+    } else {
+        "sticky"
     }
 }
 
@@ -534,13 +552,27 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .or_insert_with(|| Value::Bool(false));
     object
         .entry("theme")
-        .or_insert_with(|| Value::String("argvus-dark-float".into()));
+        .or_insert_with(|| Value::String("argvus-dark".into()));
     object
         .entry("wallpaper")
         .or_insert_with(|| Value::String("/usr/share/backgrounds/argvus/argvus-dark.jxl".into()));
     object
         .entry("gtk_mode")
         .or_insert_with(|| Value::String("dark".into()));
+    let theme = object
+        .get("theme")
+        .and_then(Value::as_str)
+        .unwrap_or("argvus-dark")
+        .to_owned();
+
+    let layout = document
+        .sections
+        .entry("layout".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let layout = layout.as_object_mut().expect("layout is object");
+    layout
+        .entry("variant")
+        .or_insert_with(|| Value::String(theme_layout_variant(&theme).into()));
 
     let effects = document
         .sections
@@ -716,7 +748,15 @@ fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
 }
 
 fn validate_layout(document: &ConfigDocument) -> ConfigResult<()> {
-    validate_numeric_section(document, "layout", 0, 100)
+    validate_numeric_section(document, "layout", 0, 100)?;
+    if let Some(variant) = document.get("/layout/variant").and_then(Value::as_str)
+        && !matches!(variant, "sticky" | "float")
+    {
+        return Err(ConfigError::Invalid(
+            "layout.variant must be sticky or float".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
@@ -1254,6 +1294,12 @@ fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
             continue;
         }
         let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            ".active-theme" | ".gtk-mode" | ".wallpaper-custom" | ".spaces" | ".borders"
+        ) {
+            continue;
+        }
         let relative = match name.as_ref() {
             ".config.lock" => PathBuf::from("data/internal/config.lock"),
             "config.json.bak" => PathBuf::from("data/backups/config.json.bak"),
@@ -1820,7 +1866,7 @@ mod tests {
         );
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
-            Some("argvus-dark-float")
+            Some("argvus-dark")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1967,7 +2013,7 @@ mod tests {
         let document = store.load().unwrap();
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
-            Some("argvus-dark-float")
+            Some("argvus-dark")
         );
         assert_eq!(
             document.get("/effects/animations"),
@@ -2106,12 +2152,17 @@ mod tests {
                 Some("#EEEEEE"),
                 Some("dark"),
                 Some("/usr/share/backgrounds/universe.jxl"),
+                false,
             )
             .unwrap();
         let document = store.load().unwrap();
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
             Some("universe")
+        );
+        assert_eq!(
+            document.get("/layout/variant").and_then(Value::as_str),
+            Some("sticky")
         );
         assert_eq!(
             document.get("/appearance/accent").and_then(Value::as_str),

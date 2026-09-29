@@ -499,12 +499,17 @@ fn run_component_adapters(
     let theme = document
         .get("/appearance/theme")
         .and_then(Value::as_str)
-        .unwrap_or("argvus-dark-float");
+        .unwrap_or("argvus-dark");
     let theme_output = paths.generated.join("theme-effective.conf");
     let theme_qml = paths.generated.join(format!(
         "quickshell/argvus-control-panel/themes/{theme}/Theme.qml"
     ));
-    if changed_sections.contains(&"appearance") || !theme_output.is_file() || !theme_qml.is_file() {
+    let theme_transaction = env::var("ARGVUS_THEME_SWITCH").ok().as_deref() == Some("1");
+    if !theme_transaction
+        && (changed_sections.contains(&"appearance")
+            || !theme_output.is_file()
+            || !theme_qml.is_file())
+    {
         run_adapter(
             &system_config.join("appearance/sh/theme-switch.sh"),
             &[theme],
@@ -512,7 +517,7 @@ fn run_component_adapters(
         )?;
     }
     let effects_output = paths.generated.join(format!("effects/{theme}.conf"));
-    if changed_sections.contains(&"effects") || !effects_output.is_file() {
+    if !theme_transaction && (changed_sections.contains(&"effects") || !effects_output.is_file()) {
         run_adapter(
             &system_config.join("session/sh/effects-toggle.sh"),
             &["apply"],
@@ -547,15 +552,10 @@ fn run_adapter(path: &Path, arguments: &[&str], paths: &ArgvusPaths) -> ConfigRe
 }
 
 fn remove_legacy_markers(root: &Path) -> ConfigResult<()> {
-    for name in [
-        ".active-theme",
-        ".accent-color",
-        ".accent-custom",
-        ".gtk-mode",
-        ".wallpaper-custom",
-        ".spaces",
-        ".borders",
-    ] {
+    // These files are still consumed by the Lua compositor and shell
+    // adapters. They are derived compatibility projections, not competing
+    // sources of truth, so do not delete them until all consumers read data/.
+    for name in [".accent-custom"] {
         let path = root.join(name);
         if path.exists() {
             fs::remove_file(path)?;

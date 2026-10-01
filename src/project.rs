@@ -15,8 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const MANIFEST_SCHEMA_VERSION: u32 = 2;
-const SECTIONS: [&str; 13] = [
+const MANIFEST_SCHEMA_VERSION: u32 = 3;
+const SECTIONS: [&str; 14] = [
     "appearance",
     "layout",
     "effects",
@@ -30,12 +30,12 @@ const SECTIONS: [&str; 13] = [
     "session",
     "calendar",
     "removable_devices",
+    "audio",
 ];
 
 #[derive(Debug, Clone)]
 pub struct ArgvusPaths {
     pub root: PathBuf,
-    pub canonical_config: PathBuf,
     pub data: PathBuf,
     pub generated: PathBuf,
     pub internal: PathBuf,
@@ -56,7 +56,6 @@ impl ArgvusPaths {
             .ok_or(ConfigError::MissingConfigDirectory)?;
         let state_root = state_home.join("argvus");
         Ok(Self {
-            canonical_config: store.path.clone(),
             data: root.join("data"),
             generated: root.join("data/generated"),
             internal: root.join("data/internal"),
@@ -97,6 +96,9 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
 
     let theme_hash = value_hash(document.get("/appearance/theme"))?;
     let accent_hash = value_hash(document.get("/appearance/accent"))?;
+    let accent_custom_hash = value_hash(document.get("/appearance/accent_custom"))?;
+    let gtk_mode_hash = value_hash(document.get("/appearance/gtk_mode"))?;
+    let wallpaper_hash = value_hash(document.get("/appearance/wallpaper"))?;
     let appearance_runtime_changed = previous_manifest
         .as_ref()
         .and_then(|manifest| manifest.get("appearance_runtime"))
@@ -105,6 +107,17 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
                 || runtime.get("accent").and_then(Value::as_str) != Some(accent_hash.as_str())
         })
         .unwrap_or(true);
+    let appearance_visual_changed = changed_sections.contains(&"appearance")
+        && (manifest_field_changed(previous_manifest.as_ref(), "theme", &theme_hash)
+            || manifest_field_changed(previous_manifest.as_ref(), "accent", &accent_hash)
+            || manifest_field_changed(
+                previous_manifest.as_ref(),
+                "accent_custom",
+                &accent_custom_hash,
+            )
+            || manifest_field_changed(previous_manifest.as_ref(), "gtk_mode", &gtk_mode_hash));
+    let wallpaper_changed = changed_sections.contains(&"appearance")
+        && manifest_field_changed(previous_manifest.as_ref(), "wallpaper", &wallpaper_hash);
 
     let mut affected_consumers = Vec::new();
     if changed_sections.contains(&"appearance") {
@@ -131,6 +144,9 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
     if changed_sections.contains(&"power") {
         affected_consumers.push("hypridle");
     }
+    if changed_sections.contains(&"audio") {
+        affected_consumers.push("audio");
+    }
     if changed_sections.iter().any(|section| {
         [
             "default_apps",
@@ -145,7 +161,31 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
     affected_consumers.sort_unstable();
     affected_consumers.dedup();
 
+    let reload_targets = reload_targets(
+        &changed_sections,
+        appearance_visual_changed,
+        wallpaper_changed,
+    );
+
+    let reload_plan = if changed_sections
+        .iter()
+        .any(|section| ["appearance", "effects", "layout"].contains(section))
+    {
+        "full"
+    } else if changed_sections
+        .iter()
+        .any(|section| ["keyboard_shortcuts", "default_apps", "hyprland"].contains(section))
+    {
+        "hyprland"
+    } else if changed_sections.contains(&"power") {
+        "hypridle"
+    } else {
+        "none"
+    };
+
     project_hypridle(&document, &paths)?;
+    project_audio(&document, &changed_sections)?;
+    project_wallpaper(&document, &paths)?;
     project_json_section(
         &document,
         "/default_apps",
@@ -158,6 +198,7 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
     )?;
     project_language(&document, &paths)?;
     project_control_panel(&document, &paths)?;
+    project_layout(&document, &paths)?;
     project_scalar(
         &document,
         "/fonts/legacy",
@@ -170,19 +211,33 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
     )?;
     project_input(&document, &paths)?;
     project_keyboard(&document, &paths)?;
+    project_shortcuts(&document, &paths)?;
     project_displays(&document, &paths)?;
     project_calendar(&document, &paths)?;
-    run_component_adapters(&document, &paths, &changed_sections)?;
+    run_component_adapters(
+        &document,
+        &paths,
+        &changed_sections,
+        appearance_visual_changed,
+    )?;
     remove_legacy_markers(&paths.root)?;
 
     let manifest = serde_json::json!({
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "canonical_hash": file_hash(&paths.canonical_config)?,
         "sections": section_hashes,
         "appearance_runtime": {"theme": theme_hash, "accent": accent_hash},
+        "appearance_values": {
+            "theme": theme_hash,
+            "accent": accent_hash,
+            "accent_custom": accent_custom_hash,
+            "gtk_mode": gtk_mode_hash,
+            "wallpaper": wallpaper_hash,
+        },
         "changed_sections": changed_sections,
         "affected_consumers": affected_consumers,
         "reload_required": !affected_consumers.is_empty(),
+        "reload_plan": reload_plan,
+        "reload_targets": reload_targets,
     });
     atomic_write(
         &paths.projection_manifest,
@@ -191,6 +246,21 @@ pub fn project(store: &ConfigStore, force: bool) -> ConfigResult<String> {
     Ok(format!(
         "argvus-config: projected canonical configuration into {}",
         paths.root.display()
+    ))
+}
+
+/// Projects only the shortcut table. Interactive settings changes use this
+/// narrow path so an unrelated theme/effects adapter cannot prevent a
+/// generated Hyprland keybinding from being applied.
+pub fn project_shortcuts_only(store: &ConfigStore) -> ConfigResult<String> {
+    let document = store.ensure()?;
+    let paths = ArgvusPaths::from_store(store)?;
+    fs::create_dir_all(&paths.generated)?;
+    fs::create_dir_all(&paths.internal)?;
+    project_shortcuts(&document, &paths)?;
+    Ok(format!(
+        "argvus-config: projected keyboard shortcuts into {}",
+        paths.generated.display()
     ))
 }
 
@@ -211,11 +281,63 @@ fn value_hash(value: Option<&Value>) -> ConfigResult<String> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn file_hash(path: &Path) -> ConfigResult<String> {
-    if !path.is_file() {
-        return Ok(String::new());
+fn manifest_field_changed(previous: Option<&Value>, field: &str, current_hash: &str) -> bool {
+    previous
+        .and_then(|manifest| manifest.get("appearance_values"))
+        .and_then(Value::as_object)
+        .and_then(|values| values.get(field))
+        .and_then(Value::as_str)
+        != Some(current_hash)
+}
+
+fn reload_targets(
+    changed_sections: &[&str],
+    appearance_visual_changed: bool,
+    wallpaper_changed: bool,
+) -> serde_json::Map<String, Value> {
+    let mut targets = serde_json::Map::new();
+    let mut enable = |name: &str| {
+        targets.insert(name.to_owned(), Value::Bool(true));
+    };
+
+    if appearance_visual_changed {
+        enable("hyprland");
+        enable("taskbar");
+        enable("widget_telemetry");
+        enable("control_panel");
+        enable("notifications");
+        enable("snappy_switcher");
+        enable("polkit");
+        enable("wallpaper");
+    } else if wallpaper_changed {
+        enable("wallpaper");
     }
-    value_hash(Some(&Value::String(fs::read_to_string(path)?)))
+
+    if changed_sections.contains(&"effects") {
+        enable("hyprland");
+        enable("taskbar");
+        enable("widget_telemetry");
+        enable("control_panel");
+        enable("notifications");
+    }
+    if changed_sections.contains(&"layout") {
+        enable("hyprland");
+        enable("taskbar");
+        enable("widget_telemetry");
+    }
+    if changed_sections.iter().any(|section| {
+        ["default_apps", "keyboard_shortcuts", "hyprland", "displays"].contains(section)
+    }) {
+        enable("hyprland");
+    }
+    if changed_sections.contains(&"control_panel") {
+        enable("control_panel");
+    }
+    if changed_sections.contains(&"power") {
+        enable("hypridle");
+    }
+
+    targets
 }
 
 fn atomic_write(path: &Path, contents: &str) -> ConfigResult<()> {
@@ -320,6 +442,89 @@ fn project_control_panel(document: &ConfigDocument, paths: &ArgvusPaths) -> Conf
     Ok(())
 }
 
+/// Projects the canonical layout values into the compatibility inputs consumed
+/// by the official Hyprland spacing and border adapters. These files remain
+/// derived state; the modular configuration files are the only persistent source of truth.
+fn project_layout(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
+    let Some(layout) = document.get("/layout").and_then(Value::as_object) else {
+        return Ok(());
+    };
+
+    if let Some(window) = layout.get("window").and_then(Value::as_object) {
+        let mut lines = Vec::new();
+        for key in [
+            "gaps_in",
+            "gaps_out_top",
+            "gaps_out_left",
+            "gaps_out_right",
+            "gaps_out_bottom",
+        ] {
+            if let Some(value) = window.get(key).and_then(Value::as_u64) {
+                lines.push(format!("{key}={value}"));
+            }
+        }
+        if let Some(value) = window.get("gaps_out").and_then(Value::as_u64) {
+            lines.push(format!("gaps_out={value}"));
+        }
+        if !lines.is_empty() {
+            atomic_write(
+                &paths.data.join(".spaces"),
+                &format!("{}\n", lines.join("\n")),
+            )?;
+        }
+
+        let mut border_lines = Vec::new();
+        if let Some(value) = window.get("rounded").and_then(Value::as_bool) {
+            border_lines.push(format!("rounded={}", u8::from(value)));
+        }
+        for key in ["rounding", "border_size"] {
+            if let Some(value) = window.get(key).and_then(Value::as_u64) {
+                let runtime_key = if key == "border_size" {
+                    "thickness"
+                } else {
+                    key
+                };
+                border_lines.push(format!("{runtime_key}={value}"));
+            }
+        }
+        if !border_lines.is_empty() {
+            atomic_write(
+                &paths.data.join(".borders"),
+                &format!("{}\n", border_lines.join("\n")),
+            )?;
+        }
+    }
+
+    if let Some(taskbar) = layout.get("taskbar").and_then(Value::as_object) {
+        let mut lines = Vec::new();
+        if let Some(value) = taskbar.get("position").and_then(Value::as_str) {
+            lines.push(format!("waybar_pos={value}"));
+        }
+        for (config_key, runtime_key) in [
+            ("margin_top", "waybar_top"),
+            ("margin_left", "waybar_left"),
+            ("margin_right", "waybar_right"),
+            ("margin_bottom", "waybar_bottom"),
+        ] {
+            if let Some(value) = taskbar.get(config_key).and_then(Value::as_u64) {
+                lines.push(format!("{runtime_key}={value}"));
+            }
+        }
+        if !lines.is_empty() {
+            let path = paths.data.join(".spaces");
+            let existing = fs::read_to_string(&path).unwrap_or_default();
+            let prefix = existing.trim_end();
+            let content = if prefix.is_empty() {
+                lines.join("\n")
+            } else {
+                format!("{prefix}\n{}", lines.join("\n"))
+            };
+            atomic_write(&path, &format!("{content}\n"))?;
+        }
+    }
+    Ok(())
+}
+
 fn project_input(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
     let Some(input) = document.get("/hyprland/input").and_then(Value::as_object) else {
         return Ok(());
@@ -341,7 +546,25 @@ fn project_input(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult
         object_value(touchpad, "two_finger_right_click").unwrap_or(&Value::Bool(true)),
         object_value(touchpad, "disable_while_typing").unwrap_or(&Value::Bool(true))
     );
-    atomic_write(&paths.data.join("hypr/input.toml"), &toml)
+    atomic_write(&paths.data.join("hypr/input.toml"), &toml)?;
+    let lua = format!(
+        "-- Generated by argvus-config. Do not edit.\nreturn {{\n  sensitivity = {},\n  accel_profile = {},\n  natural_scroll = {},\n  scroll_factor = {},\n  left_handed = {},\n  touchpad = {{\n    natural_scroll = {},\n    tap_to_click = {},\n    tap_and_drag = {},\n    clickfinger_behavior = {},\n    disable_while_typing = {},\n  }},\n}}\n",
+        object_value(mouse, "sensitivity").unwrap_or(&Value::from(0)),
+        serde_json::to_string(
+            object_value(mouse, "accel_profile")
+                .and_then(Value::as_str)
+                .unwrap_or("flat")
+        )?,
+        object_value(mouse, "natural_scroll").unwrap_or(&Value::Bool(false)),
+        object_value(mouse, "scroll_factor").unwrap_or(&Value::from(1)),
+        object_value(mouse, "left_handed").unwrap_or(&Value::Bool(false)),
+        object_value(touchpad, "natural_scroll").unwrap_or(&Value::Bool(false)),
+        object_value(touchpad, "tap_to_click").unwrap_or(&Value::Bool(true)),
+        object_value(touchpad, "tap_and_drag").unwrap_or(&Value::Bool(true)),
+        object_value(touchpad, "two_finger_right_click").unwrap_or(&Value::Bool(false)),
+        object_value(touchpad, "disable_while_typing").unwrap_or(&Value::Bool(true)),
+    );
+    atomic_write(&paths.generated.join("hypr/input-settings.lua"), &lua)
 }
 
 fn object_value<'a>(
@@ -368,8 +591,7 @@ fn project_keyboard(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRes
             quote("variant")?,
             quote("options")?
         ),
-    )?;
-    project_shortcuts(document, paths)
+    )
 }
 
 fn project_shortcuts(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
@@ -381,6 +603,7 @@ fn project_shortcuts(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRe
     };
     let mut lua = String::from("-- Generated by argvus-config. Do not edit.\nreturn {\n");
     let mut toml = String::new();
+    let binding_ids = shortcut_binding_ids();
     for (key, shortcut) in shortcuts {
         let (keys, enabled) = match shortcut {
             Value::String(value) => (Some(value.as_str()), true),
@@ -391,7 +614,8 @@ fn project_shortcuts(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRe
                 )));
             }
         };
-        lua.push_str(&format!("  [{}] = {{", serde_json::to_string(key)?));
+        let binding_id = binding_ids.get(key).map(String::as_str).unwrap_or(key);
+        lua.push_str(&format!("  [{}] = {{", serde_json::to_string(binding_id)?));
         if let Some(keys) = keys {
             lua.push_str(&format!(" keys = {},", serde_json::to_string(keys)?));
         }
@@ -408,6 +632,34 @@ fn project_shortcuts(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRe
     atomic_write(&paths.data.join("hypr/keybindings.toml"), &toml)
 }
 
+fn shortcut_binding_ids() -> std::collections::BTreeMap<String, String> {
+    let manifest_path = env::var_os("ARGVUS_SYSTEM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/argvus"))
+        .join("hyprland/keybindings.json");
+    let Ok(contents) = fs::read_to_string(manifest_path) else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<Value>(&contents) else {
+        return std::collections::BTreeMap::new();
+    };
+    manifest
+        .get("bindings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| {
+            let binding_id = binding.get("id")?.as_str()?;
+            let config_key = binding
+                .get("config_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::config_key_for_binding(binding_id));
+            Some((config_key, binding_id.to_owned()))
+        })
+        .collect()
+}
+
 fn project_displays(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
     let Some(displays) = document.get("/displays").and_then(Value::as_object) else {
         return Ok(());
@@ -422,12 +674,55 @@ fn project_displays(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRes
             if monitor.get("disabled").and_then(Value::as_bool) == Some(true) {
                 output.push_str(", disabled = true");
             }
-            for key in ["mode", "position", "scale", "transform"] {
+            for key in [
+                "mode",
+                "position",
+                "scale",
+                "transform",
+                "mirror",
+                "bitdepth",
+                "vrr",
+                "hdr",
+                "sdr_brightness",
+                "sdr_saturation",
+            ] {
                 if let Some(value) = monitor.get(key) {
-                    output.push_str(&format!(", {key} = {}", lua_value(value)?));
+                    let runtime_key = match key {
+                        "hdr" => "supports_hdr",
+                        "sdr_brightness" => "sdrbrightness",
+                        "sdr_saturation" => "sdrsaturation",
+                        _ => key,
+                    };
+                    output.push_str(&format!(", {runtime_key} = {}", lua_value(value)?));
                 }
             }
             output.push_str(" })\n");
+        }
+    }
+    if let Some(workspaces) = displays.get("workspaces").and_then(Value::as_object) {
+        let primary_monitor = displays.get("primary_monitor").and_then(Value::as_str);
+        let mut emitted_workspace_one = false;
+        for (monitor, workspace_ids) in workspaces {
+            let Some(workspace_ids) = workspace_ids.as_array() else {
+                continue;
+            };
+            for (index, workspace_id) in workspace_ids.iter().filter_map(Value::as_u64).enumerate()
+            {
+                let is_default = primary_monitor == Some(monitor.as_str()) && index == 0;
+                emitted_workspace_one |= workspace_id == 1;
+                output.push_str(&format!(
+                    "hl.workspace_rule({{ workspace = {}, monitor = {}{} }})\n",
+                    serde_json::to_string(&workspace_id.to_string())?,
+                    serde_json::to_string(monitor)?,
+                    if is_default { ", default = true" } else { "" }
+                ));
+            }
+        }
+        if !emitted_workspace_one && let Some(primary_monitor) = primary_monitor {
+            output.push_str(&format!(
+                "hl.workspace_rule({{ workspace = \"1\", monitor = {}, default = true }})\n",
+                serde_json::to_string(primary_monitor)?
+            ));
         }
     }
     atomic_write(&paths.generated.join("hypr/monitors.lua"), &output)
@@ -455,6 +750,52 @@ fn project_calendar(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRes
     )
 }
 
+/// Projects the canonical wallpaper path into the user-facing hyprpaper
+/// configuration consumed by the appearance/session helpers. The wallpaper
+/// service remains responsible for selecting the runtime backend and monitor
+/// layout; this file only carries the durable selected path.
+fn project_wallpaper(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
+    let Some(wallpaper) = document
+        .get("/appearance/wallpaper")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let path = paths.data.join("hypr/hyprpaper.conf");
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let display_path = home
+        .as_ref()
+        .and_then(|home| {
+            let home_prefix = format!("{}/", home.display());
+            wallpaper.strip_prefix(home_prefix.as_str())
+        })
+        .map(|relative| format!("~/{relative}"))
+        .unwrap_or_else(|| wallpaper.to_owned());
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut output = String::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        if line.trim_start().starts_with("path =") {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            output.push_str(&format!("{indent}path = {display_path}\n"));
+            replaced = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !replaced {
+        if !output.trim().is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!(
+            "wallpaper {{\n  monitor =\n  path = {display_path}\n  fit_mode = cover\n}}\n\nsplash = false\n"
+        ));
+    }
+    atomic_write(&path, &output)
+}
+
 fn scalar(object: &serde_json::Map<String, Value>, key: &str, default: impl Into<Value>) -> Value {
     object.get(key).cloned().unwrap_or_else(|| default.into())
 }
@@ -471,13 +812,13 @@ fn project_hypridle(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRes
     let lock_minutes = document
         .get("/power/lock_minutes")
         .and_then(Value::as_u64)
-        .unwrap_or(15);
+        .unwrap_or(30);
     let screen_minutes = document
         .get("/power/screen_off_minutes")
         .and_then(Value::as_u64)
-        .unwrap_or(30);
+        .unwrap_or(0);
     let mut text = String::from(
-        "# ARGVUS hypridle configuration\n# Generated from config.json by argvus-config project. Do not edit.\n\ngeneral {\n  lock_cmd = sh /usr/share/argvus/power/sh/hypr-power-menu.sh --lock\n  before_sleep_cmd = sh /usr/share/argvus/power/sh/hypr-power-menu.sh --lock\n  after_sleep_cmd = hyprctl dispatch 'hl.dsp.dpms({ action = \"on\" })'\n}\n",
+        "# ARGVUS hypridle configuration\n# Generated from modular ARGVUS configuration by argvus-config project. Do not edit.\n\ngeneral {\n  lock_cmd = sh /usr/share/argvus/power/sh/hypr-power-menu.sh --lock\n  before_sleep_cmd = sh /usr/share/argvus/power/sh/hypr-power-menu.sh --lock\n  after_sleep_cmd = hyprctl dispatch 'hl.dsp.dpms({ action = \"on\" })'\n}\n",
     );
     if lock_minutes > 0 {
         text.push_str(&format!("\nlistener {{\n  timeout = {}\n  on-timeout = sh /usr/share/argvus/power/sh/hypr-power-menu.sh --lock\n}}\n", lock_minutes * 60));
@@ -485,13 +826,69 @@ fn project_hypridle(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigRes
     if screen_minutes > 0 {
         text.push_str(&format!("\nlistener {{\n  timeout = {}\n  on-timeout = hyprctl dispatch 'hl.dsp.dpms({{ action = \"off\" }})'\n  on-resume = hyprctl dispatch 'hl.dsp.dpms({{ action = \"on\" }})'\n}}\n", screen_minutes * 60));
     }
-    atomic_write(&paths.data.join("hypr/hypridle.conf"), &text)
+    // hypridle is an application-owned runtime configuration. Keep the
+    // generated file at the same path resolved by paths_config() and by the
+    // Control Center; leaving a second copy makes the running service consume
+    // stale values.
+    let runtime_path = paths.data.join("hypr/hypridle.conf");
+    atomic_write(&runtime_path, &text)?;
+    // Retire the pre-`data/` runtime file so the idle service cannot fall
+    // back to a stale copy at the configuration root.
+    let obsolete_path = paths.root.join("hypr/hypridle.conf");
+    if obsolete_path != runtime_path && obsolete_path.exists() {
+        fs::remove_file(obsolete_path)?;
+    }
+    Ok(())
+}
+
+/// Applies audio values from the canonical module to the default PipeWire
+/// sink. Audio has no durable application config file, so wpctl is the
+/// projection adapter and the modular JSON remains the persistent source.
+fn project_audio(document: &ConfigDocument, changed_sections: &[&str]) -> ConfigResult<()> {
+    if !changed_sections.contains(&"audio") {
+        return Ok(());
+    }
+    let volume = document
+        .get("/audio/output_volume")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .min(100);
+    let muted = document
+        .get("/audio/output_muted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let volume_value = format!("{volume}%");
+    let volume_status = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &volume_value])
+        .status();
+    report_audio_projection("volume", volume_status);
+
+    let mute_status = Command::new("wpctl")
+        .args([
+            "set-mute",
+            "@DEFAULT_AUDIO_SINK@",
+            if muted { "1" } else { "0" },
+        ])
+        .status();
+    report_audio_projection("mute", mute_status);
+    Ok(())
+}
+
+fn report_audio_projection(action: &str, result: std::io::Result<std::process::ExitStatus>) {
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("argvus-config: wpctl {action} projection exited with {status}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("argvus-config: wpctl {action} projection failed: {error}"),
+    }
 }
 
 fn run_component_adapters(
     document: &ConfigDocument,
     paths: &ArgvusPaths,
     changed_sections: &[&str],
+    appearance_visual_changed: bool,
 ) -> ConfigResult<()> {
     let system_config = env::var_os("ARGVUS_SYSTEM_CONFIG")
         .map(PathBuf::from)
@@ -505,10 +902,9 @@ fn run_component_adapters(
         "quickshell/argvus-control-panel/themes/{theme}/Theme.qml"
     ));
     let theme_transaction = env::var("ARGVUS_THEME_SWITCH").ok().as_deref() == Some("1");
+    let theme_missing = !theme_output.is_file() || !theme_qml.is_file();
     if !theme_transaction
-        && (changed_sections.contains(&"appearance")
-            || !theme_output.is_file()
-            || !theme_qml.is_file())
+        && (appearance_visual_changed || (changed_sections.is_empty() && theme_missing))
     {
         run_adapter(
             &system_config.join("appearance/sh/theme-switch.sh"),
@@ -517,7 +913,11 @@ fn run_component_adapters(
         )?;
     }
     let effects_output = paths.generated.join(format!("effects/{theme}.conf"));
-    if !theme_transaction && (changed_sections.contains(&"effects") || !effects_output.is_file()) {
+    let effects_missing = !effects_output.is_file();
+    if !theme_transaction
+        && (changed_sections.contains(&"effects")
+            || (changed_sections.is_empty() && effects_missing))
+    {
         run_adapter(
             &system_config.join("session/sh/effects-toggle.sh"),
             &["apply"],
@@ -555,11 +955,99 @@ fn remove_legacy_markers(root: &Path) -> ConfigResult<()> {
     // These files are still consumed by the Lua compositor and shell
     // adapters. They are derived compatibility projections, not competing
     // sources of truth, so do not delete them until all consumers read data/.
-    for name in [".accent-custom"] {
-        let path = root.join(name);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+    let path = root.join("data/.accent-custom");
+    if path.exists() {
+        fs::remove_file(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hypridle_projection_uses_the_runtime_consumer_path() {
+        let root = env::temp_dir().join(format!("argvus-project-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = ArgvusPaths {
+            data: root.join("data"),
+            generated: root.join("data/generated"),
+            internal: root.join("data/internal"),
+            backups: root.join("data/backups"),
+            projection_manifest: root.join("state/config-projection.json"),
+            root: root.clone(),
+        };
+        let mut document = ConfigDocument::default();
+        document
+            .set("/power/lock_minutes", Value::from(15))
+            .expect("valid power value");
+        document
+            .set("/power/screen_off_minutes", Value::from(10))
+            .expect("valid power value");
+
+        project_hypridle(&document, &paths).expect("hypridle projection succeeds");
+        let runtime = fs::read_to_string(root.join("data/hypr/hypridle.conf"))
+            .expect("runtime hypridle file exists");
+        assert!(runtime.contains("timeout = 900"));
+        assert!(runtime.contains("timeout = 600"));
+        assert!(!root.join("hypr/hypridle.conf").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_targets_keep_power_changes_scoped_to_hypridle() {
+        let targets = reload_targets(&["power"], false, false);
+        assert_eq!(targets.get("hypridle"), Some(&Value::Bool(true)));
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn reload_targets_keep_wallpaper_changes_scoped_to_wallpaper() {
+        let targets = reload_targets(&["appearance"], false, true);
+        assert_eq!(targets.get("wallpaper"), Some(&Value::Bool(true)));
+        assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn reload_targets_expand_theme_changes_to_visual_consumers() {
+        let targets = reload_targets(&["appearance"], true, true);
+        for target in [
+            "hyprland",
+            "taskbar",
+            "widget_telemetry",
+            "control_panel",
+            "notifications",
+            "wallpaper",
+        ] {
+            assert_eq!(targets.get(target), Some(&Value::Bool(true)), "{target}");
+        }
+    }
+
+    #[test]
+    fn wallpaper_projection_updates_the_native_hyprpaper_file() {
+        let root = env::temp_dir().join(format!("argvus-wallpaper-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = ArgvusPaths {
+            data: root.join("data"),
+            generated: root.join("data/generated"),
+            internal: root.join("data/internal"),
+            backups: root.join("data/backups"),
+            projection_manifest: root.join("state/config-projection.json"),
+            root: root.clone(),
+        };
+        let mut document = ConfigDocument::default();
+        document
+            .set(
+                "/appearance/wallpaper",
+                Value::from("/usr/share/backgrounds/argvus/argvus-dark.jxl"),
+            )
+            .expect("valid wallpaper value");
+
+        project_wallpaper(&document, &paths).expect("wallpaper projection succeeds");
+        let native = fs::read_to_string(root.join("data/hypr/hyprpaper.conf"))
+            .expect("native wallpaper file exists");
+        assert!(native.contains("path = /usr/share/backgrounds/argvus/argvus-dark.jxl"));
+        let _ = fs::remove_dir_all(root);
+    }
 }

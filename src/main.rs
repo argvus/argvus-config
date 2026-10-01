@@ -36,17 +36,33 @@ fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "set" => set_value(&store, &arguments[1..])?,
         "patch" => patch_value(&store, &arguments[1..])?,
         "apply-theme" => apply_theme(&store, &arguments[1..])?,
+        "apply-mode" => apply_mode(&store, &arguments[1..])?,
         "unset" => {
             let pointer = arguments.get(1).ok_or("usage: argvus-config unset /path")?;
             store.unset(pointer)?;
         }
         "export" => export_scope(&store, &arguments[1..])?,
         "import" => import_scope(&store, &arguments[1..])?,
-        "project" => argvus_config_core::project::project(
-            &store,
-            arguments.iter().any(|argument| argument == "--force"),
-        )
-        .map(|message| println!("{message}"))?,
+        "project" => {
+            let only = arguments
+                .iter()
+                .position(|argument| argument == "--only")
+                .and_then(|index| arguments.get(index + 1))
+                .map(String::as_str);
+            let message = match only {
+                Some("keyboard_shortcuts") => {
+                    argvus_config_core::project::project_shortcuts_only(&store)?
+                }
+                Some(section) => {
+                    return Err(format!("unsupported projection section: {section}").into());
+                }
+                None => argvus_config_core::project::project(
+                    &store,
+                    arguments.iter().any(|argument| argument == "--force"),
+                )?,
+            };
+            println!("{message}");
+        }
         "help" | "--help" | "-h" => print_help(),
         other => return Err(format!("unknown command: {other}").into()),
     }
@@ -111,7 +127,7 @@ fn apply_theme(
     store: &ConfigStore,
     arguments: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let theme = arguments.first().ok_or("usage: argvus-config apply-theme THEME [--accent HEX] [--gtk-mode MODE] [--wallpaper PATH] [--reset-wallpaper]")?;
+    let theme = arguments.first().ok_or("usage: argvus-config apply-theme THEME [--accent HEX] [--gtk-mode MODE] [--wallpaper PATH] [--reset-wallpaper] [--reset-accent]")?;
     let option = |name: &str| {
         arguments
             .iter()
@@ -125,15 +141,23 @@ fn apply_theme(
     let gtk_mode = option("--gtk-mode")
         .map(String::as_str)
         .or_else(|| manifest.get("mode").and_then(Value::as_str));
+    let flag = |name: &str| arguments.iter().any(|argument| argument == name);
     store.apply_theme(
         theme,
         accent,
         gtk_mode,
         option("--wallpaper").map(String::as_str),
-        arguments
-            .iter()
-            .any(|argument| argument == "--reset-wallpaper"),
+        flag("--reset-wallpaper"),
+        flag("--reset-accent"),
     )?;
+    Ok(())
+}
+
+fn apply_mode(store: &ConfigStore, arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let variant = arguments
+        .first()
+        .ok_or("usage: argvus-config apply-mode <sticky|float>")?;
+    store.apply_layout_variant(variant)?;
     Ok(())
 }
 
@@ -214,15 +238,21 @@ fn import_scope(
 
 fn print_help() {
     println!(
-        "argvus-config path|validate|ensure|migrate|get|set|patch|apply-theme|unset|export|import|project [--force]"
+        "argvus-config path|validate|ensure|migrate|get|set|patch|apply-theme|apply-mode|unset|export|import|project [--force|--only keyboard_shortcuts]"
     );
     println!("  ensure  materialize canonical defaults without resetting explicit values");
     println!("  get /appearance/theme [--effective] [--raw]");
     println!("  set /appearance/theme \"argvus-dark\"");
     println!("  patch FILE|-                         atomically update multiple JSON pointers");
     println!("  apply-theme THEME [theme options]     atomically apply theme-owned fields");
+    println!(
+        "  apply-mode <sticky|float>             switch Sticky/Float without changing the theme"
+    );
     println!("  export --scope appearance|desktop [--output FILE]");
     println!("  import --scope appearance|desktop FILE");
-    println!("  project  incrementally generate native and generated files from config.json");
+    println!(
+        "  project  incrementally generate native and generated files from modular configuration"
+    );
     println!("           use --force to regenerate every projection");
+    println!("           use --only keyboard_shortcuts for shortcut-only projection");
 }

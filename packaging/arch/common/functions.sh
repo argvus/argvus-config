@@ -14,6 +14,7 @@ arch_check_payload() {
 	local source_root="${srcdir}/${pkgname}-${pkgver}"
 	test -x "$source_root/target/release/argvus-config"
 	test -f "$source_root/src/usr/share/argvus/config/schema.json"
+	compgen -G "$source_root/src/usr/share/argvus/config/*.json" | grep -q .
 }
 
 arch_package_payload() {
@@ -22,6 +23,8 @@ arch_package_payload() {
 		"$pkgdir/usr/bin/argvus-config"
 	install -Dm644 "$source_root/src/usr/share/argvus/config/schema.json" \
 		"$pkgdir/usr/share/argvus/config/schema.json"
+	find "$source_root/src/usr/share/argvus/config" -maxdepth 1 -type f -name '*.json' \
+		! -name schema.json -exec install -Dm644 {} -t "$pkgdir/usr/share/argvus/config" \;
 	install -Dm644 "$source_root/LICENSE" \
 		"$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

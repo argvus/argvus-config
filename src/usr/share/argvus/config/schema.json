@@ -35,8 +35,13 @@
           "properties": {
             "gaps_in": { "type": "integer", "minimum": 0, "maximum": 100 },
             "gaps_out": { "type": "integer", "minimum": 0, "maximum": 100 },
-            "border_size": { "type": "integer", "minimum": 0, "maximum": 20 },
-            "rounding": { "type": "integer", "minimum": 0, "maximum": 50 }
+            "gaps_out_top": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "gaps_out_left": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "gaps_out_right": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "gaps_out_bottom": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "rounded": { "type": "boolean" },
+            "border_size": { "type": "integer", "minimum": 0, "maximum": 10 },
+            "rounding": { "type": "integer", "minimum": 0, "maximum": 10 }
           }
         },
         "taskbar": {
@@ -55,6 +60,8 @@
       "type": "object",
       "properties": {
         "animations": { "type": "boolean" },
+        "widget_telemetry_enabled": { "type": "boolean" },
+        "blur_global_enabled": { "type": "boolean" },
         "blur_global_value": { "type": "integer", "minimum": 0, "maximum": 100 },
         "transparency_taskbar_enabled": { "type": "boolean" },
         "transparency_taskbar_value": { "type": "integer", "minimum": 0, "maximum": 100 },
@@ -161,6 +168,14 @@
     },
     "calendar": { "type": "object" },
     "removable_devices": { "type": "object" },
+    "audio": {
+      "type": "object",
+      "properties": {
+        "output_volume": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "output_muted": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
     "extensions": { "type": "object" }
   }
 }

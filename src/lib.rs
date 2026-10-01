@@ -1,7 +1,7 @@
 //! Canonical user configuration for the ARGVUS desktop.
 //!
-//! The document stores logical user preferences. Generated files and native
-//! application overrides remain projections outside this file.
+//! The document stores logical user preferences loaded from modular section
+//! files. Generated files and native application overrides remain projections.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -19,8 +19,9 @@ pub mod project;
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 const LOCK_FILE: &str = "data/internal/config.lock";
 const BACKUP_FILE: &str = "data/backups/config.json.bak";
+const MODULE_DIRECTORY: &str = "config";
 
-const KNOWN_SECTIONS: [&str; 13] = [
+const KNOWN_SECTIONS: [&str; 14] = [
     "appearance",
     "layout",
     "effects",
@@ -34,6 +35,7 @@ const KNOWN_SECTIONS: [&str; 13] = [
     "session",
     "calendar",
     "removable_devices",
+    "audio",
 ];
 
 #[derive(Debug, Error)]
@@ -99,6 +101,7 @@ impl ConfigScope {
                 "session",
                 "calendar",
                 "removable_devices",
+                "audio",
             ],
         }
     }
@@ -149,6 +152,7 @@ impl ConfigDocument {
         validate_default_apps(self)?;
         validate_keyboard_shortcuts(self)?;
         validate_power(self)?;
+        validate_audio(self)?;
         validate_session(self)?;
         Ok(())
     }
@@ -250,17 +254,21 @@ impl ConfigStore {
             .ok_or(ConfigError::MissingConfigDirectory)?;
         let directory = config_home.join("argvus");
         Ok(Self {
-            path: directory.join("config.json"),
+            path: directory.join(MODULE_DIRECTORY),
             lock_path: directory.join(LOCK_FILE),
         })
     }
 
     pub fn load(&self) -> ConfigResult<ConfigDocument> {
-        ConfigDocument::load(&self.path)
+        self.load_legacy_or_modules(self.config_root()?)
     }
 
     pub fn load_effective(&self) -> ConfigResult<ConfigDocument> {
-        ConfigDocument::load_effective(&self.path)
+        let mut document = self.load_legacy_or_modules(self.config_root()?)?;
+        apply_packaged_defaults(&mut document)?;
+        apply_defaults(&mut document);
+        document.validate()?;
+        Ok(document)
     }
 
     /// Create or complete the canonical document without replacing explicit
@@ -269,23 +277,18 @@ impl ConfigStore {
         let lock = self.open_lock()?;
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
-        let was_missing = !self.path.exists();
-        let mut document = if !was_missing {
-            self.load()?
-        } else {
-            ConfigDocument::default()
-        };
+        let root = self.config_root()?;
+        let directory = self.module_directory();
+        let was_missing = !directory.exists();
+        let mut document = self.load_legacy_or_modules(&root)?;
         let before = document.clone();
-        let root = self
-            .path
-            .parent()
-            .ok_or(ConfigError::MissingConfigDirectory)?;
         let imported = import_legacy_values(&mut document, root)?;
         let moved = migrate_legacy_layout(root)?;
+        apply_packaged_defaults(&mut document)?;
         apply_defaults(&mut document);
         document.validate()?;
-        if document != before || imported || moved || was_missing {
-            self.save_locked(&document)?;
+        if document != before || imported || moved || was_missing || !directory.exists() {
+            self.save_modules_locked(&document)?;
         }
         Ok(document)
     }
@@ -295,7 +298,7 @@ impl ConfigStore {
         let lock = self.open_lock()?;
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
-        self.save_locked(document)
+        self.save_modules_locked(document)
     }
 
     fn open_lock(&self) -> ConfigResult<File> {
@@ -315,32 +318,115 @@ impl ConfigStore {
             .open(&self.lock_path)?)
     }
 
-    fn save_locked(&self, document: &ConfigDocument) -> ConfigResult<()> {
-        let directory = self
-            .path
+    fn config_root(&self) -> ConfigResult<&Path> {
+        self.path
             .parent()
-            .ok_or(ConfigError::MissingConfigDirectory)?;
-        fs::create_dir_all(directory)?;
-        if self.path.exists() {
-            let backup = directory.join(BACKUP_FILE);
+            .ok_or(ConfigError::MissingConfigDirectory)
+    }
+
+    fn module_directory(&self) -> PathBuf {
+        if self.path.file_name().and_then(|name| name.to_str()) == Some("config.json") {
+            self.path
+                .parent()
+                .unwrap_or(&self.path)
+                .join(MODULE_DIRECTORY)
+        } else {
+            self.path.clone()
+        }
+    }
+
+    fn load_legacy_or_modules(&self, root: &Path) -> ConfigResult<ConfigDocument> {
+        let directory = self.module_directory();
+        if directory.is_dir() && fs::read_dir(&directory)?.next().is_some() {
+            return self.load_modular(false);
+        }
+        let legacy = root.join("config.json");
+        if legacy.is_file() {
+            return ConfigDocument::load(&legacy);
+        }
+        Ok(ConfigDocument::default())
+    }
+
+    fn load_modular(&self, apply_default_values: bool) -> ConfigResult<ConfigDocument> {
+        let directory = self.module_directory();
+        let mut document = ConfigDocument::default();
+        if directory.is_dir() {
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(section) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+                if !value.is_object() {
+                    return Err(ConfigError::Invalid(format!(
+                        "section {section} must be a JSON object"
+                    )));
+                }
+                document.sections.insert(section.to_owned(), value);
+            }
+        }
+        if apply_default_values {
+            apply_packaged_defaults(&mut document)?;
+            apply_defaults(&mut document);
+        }
+        document.validate()?;
+        Ok(document)
+    }
+
+    fn save_modules_locked(&self, document: &ConfigDocument) -> ConfigResult<()> {
+        let root = self.config_root()?;
+        let directory = self.module_directory();
+        fs::create_dir_all(&directory)?;
+        let legacy = root.join("config.json");
+        let backup = root.join(BACKUP_FILE);
+        if directory.is_dir() && fs::read_dir(&directory)?.next().is_some() {
+            let previous = self.load_modular(false)?;
             if let Some(parent) = backup.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&self.path, backup)?;
+            let contents = serde_json::to_string_pretty(&previous)?;
+            fs::write(&backup, format!("{contents}\n"))?;
         }
-        let temporary = self
-            .path
-            .with_extension(format!("json.tmp-{}", std::process::id()));
-        let contents = serde_json::to_vec_pretty(document)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&contents)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&temporary, &self.path)?;
+        if legacy.is_file() {
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&legacy, backup)?;
+        }
+        for (section, value) in &document.sections {
+            let path = directory.join(format!("{section}.json"));
+            let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+            fs::rename(temporary, path)?;
+        }
+        if directory.is_dir() {
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let Some(section) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                    && !document.sections.contains_key(section)
+                {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        if legacy.is_file() {
+            fs::remove_file(legacy)?;
+        }
         Ok(())
     }
 
@@ -366,6 +452,11 @@ impl ConfigStore {
 
     /// Atomically apply the theme-owned appearance fields while preserving
     /// explicit user overrides recorded in the canonical document.
+    ///
+    /// `reset_custom_accent` clears an explicit accent override so the theme
+    /// default wins. Selecting an official theme sets it, so a highlight color
+    /// chosen earlier never survives a theme change. Projections, session
+    /// startup and custom profile applies leave it false and keep the override.
     pub fn apply_theme(
         &self,
         theme: &str,
@@ -373,13 +464,22 @@ impl ConfigStore {
         gtk_mode: Option<&str>,
         wallpaper: Option<&str>,
         reset_custom_wallpaper: bool,
+        reset_custom_accent: bool,
     ) -> ConfigResult<ConfigDocument> {
         self.modify(|document| {
             document.set("/appearance/theme", Value::String(theme.to_owned()))?;
-            document.set(
-                "/layout/variant",
-                Value::String(theme_layout_variant(theme).to_owned()),
-            )?;
+            // Sticky/Float is an independent setting (see `apply_layout_variant`);
+            // applying a theme must not change the mode the user already chose, so
+            // only the geometry for the *current* variant is reasserted here.
+            let current_variant = document
+                .get("/layout/variant")
+                .and_then(Value::as_str)
+                .unwrap_or("sticky")
+                .to_owned();
+            reset_layout_geometry(document, &current_variant)?;
+            if reset_custom_accent {
+                document.set("/appearance/accent_custom", Value::Bool(false))?;
+            }
             let accent_custom = document
                 .get("/appearance/accent_custom")
                 .and_then(Value::as_bool)
@@ -409,6 +509,31 @@ impl ConfigStore {
         })
     }
 
+    /// Set the Sticky/Float layout mode independently of the active theme.
+    ///
+    /// Unlike `apply_theme`, this is the only place that writes
+    /// `/layout/variant`, keeping it decoupled from theme selection: picking
+    /// a theme never changes the mode, and picking a mode never changes the
+    /// theme. The baseline geometry for the new mode is reasserted the same
+    /// way a theme switch does, so Control Panel overrides from the previous
+    /// mode do not leak into the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `variant` is not `"sticky"` or `"float"`, or
+    /// when the canonical document cannot be read, validated or saved.
+    pub fn apply_layout_variant(&self, variant: &str) -> ConfigResult<ConfigDocument> {
+        if variant != "sticky" && variant != "float" {
+            return Err(ConfigError::Invalid(
+                "layout.variant must be sticky or float".into(),
+            ));
+        }
+        self.modify(|document| {
+            document.set("/layout/variant", Value::String(variant.to_owned()))?;
+            reset_layout_geometry(document, variant)
+        })
+    }
+
     /// Perform a read-modify-write transaction under the same lock used by
     /// `save`. Callers must use this for every canonical mutation so two UI
     /// processes cannot overwrite each other's sections with stale documents.
@@ -429,23 +554,52 @@ impl ConfigStore {
         let lock = self.open_lock()?;
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
-        let mut document = self.load()?;
+        let mut document = self.load_legacy_or_modules(self.config_root()?)?;
+        apply_packaged_defaults(&mut document)?;
+        apply_defaults(&mut document);
         let before = document.clone();
         if operation(&mut document)? && document != before {
-            self.save_locked(&document)?;
+            self.save_modules_locked(&document)?;
         }
         Ok(document)
     }
 
     pub fn migrate_legacy(&self) -> ConfigResult<ConfigDocument> {
-        let root = self
-            .path
-            .parent()
-            .ok_or(ConfigError::MissingConfigDirectory)?;
+        let root = self.config_root()?;
         let result = self.modify_if_changed(|document| import_legacy_values(document, root));
         migrate_legacy_layout(root)?;
         result
     }
+}
+
+/// A theme mode owns the baseline geometry for windows and the taskbar. Keep
+/// those canonical values synchronized with the variant so the next
+/// projection cannot restore the previous mode's derived `.spaces`/`.borders`.
+fn reset_layout_geometry(document: &mut ConfigDocument, variant: &str) -> ConfigResult<()> {
+    let (gaps_in, gaps_out, rounded, rounding, border_size, margins) = if variant == "float" {
+        (4, 18, true, 4, 1, [18, 18, 18, 18])
+    } else {
+        (2, 0, false, 0, 1, [0, 0, 0, 2])
+    };
+    let values = [
+        ("/layout/window/gaps_in", Value::from(gaps_in)),
+        ("/layout/window/gaps_out_top", Value::from(gaps_out)),
+        ("/layout/window/gaps_out_left", Value::from(gaps_out)),
+        ("/layout/window/gaps_out_right", Value::from(gaps_out)),
+        ("/layout/window/gaps_out_bottom", Value::from(gaps_out)),
+        ("/layout/window/rounded", Value::Bool(rounded)),
+        ("/layout/window/rounding", Value::from(rounding)),
+        ("/layout/window/border_size", Value::from(border_size)),
+        ("/layout/taskbar/position", Value::String("top".into())),
+        ("/layout/taskbar/margin_top", Value::from(margins[0])),
+        ("/layout/taskbar/margin_left", Value::from(margins[1])),
+        ("/layout/taskbar/margin_right", Value::from(margins[2])),
+        ("/layout/taskbar/margin_bottom", Value::from(margins[3])),
+    ];
+    for (pointer, value) in values {
+        document.set(pointer, value)?;
+    }
+    Ok(())
 }
 
 fn theme_layout_variant(theme: &str) -> &'static str {
@@ -458,30 +612,138 @@ fn theme_layout_variant(theme: &str) -> &'static str {
 
 fn import_legacy_values(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
     let mut changed = false;
-    changed |= import_line(document, "/appearance/theme", &root.join(".active-theme"))?;
-    let imported_accent = import_line(document, "/appearance/accent", &root.join(".accent-color"))?;
+    changed |= import_line(
+        document,
+        "/appearance/theme",
+        resolved(root, ".active-theme"),
+    )?;
+    // Legacy installs encoded Sticky/Float as a `-float` suffix on the theme
+    // name itself (e.g. `.active-theme` containing `argvus-dark-float`).
+    // Strip it into the now-independent `/layout/variant` so the user's
+    // existing mode survives the migration instead of being silently lost.
+    changed |= migrate_theme_suffix_to_variant(document)?;
+    let imported_accent = import_line(
+        document,
+        "/appearance/accent",
+        resolved(root, ".accent-color"),
+    )?;
     changed |= imported_accent;
-    if imported_accent && root.join(".accent-custom").is_file() {
+    if imported_accent && resolved(root, ".accent-custom").is_some_and(|path| path.is_file()) {
         document.set("/appearance/accent_custom", Value::Bool(true))?;
         changed = true;
     }
-    changed |= import_line(document, "/appearance/gtk_mode", &root.join(".gtk-mode"))?;
+    changed |= import_line(
+        document,
+        "/appearance/gtk_mode",
+        resolved(root, ".gtk-mode"),
+    )?;
     changed |= import_line(
         document,
         "/appearance/wallpaper",
-        &root.join(".wallpaper-custom"),
+        resolved(root, ".wallpaper-custom"),
     )?;
-    changed |= import_raw(document, "/layout/spaces_legacy", &root.join(".spaces"))?;
-    changed |= import_raw(document, "/layout/borders_legacy", &root.join(".borders"))?;
-    changed |= import_fonts(document, &root.join("fonts.conf"))?;
+    changed |= import_layout_state(document, root)?;
+    changed |= import_fonts(document, resolved(root, "fonts.conf"))?;
     changed |= import_hyprland(document, root)?;
     changed |= import_displays(document, root)?;
-    changed |= import_defaults(document, &root.join("defaults.json"))?;
+    changed |= import_defaults(document, resolved(root, "defaults.json"))?;
     changed |= import_keyboard_shortcuts(document, root)?;
-    changed |= import_language(document, &root.join("language"))?;
+    changed |= import_language(document, resolved(root, "language"))?;
     changed |= import_power(document, root)?;
     changed |= import_removable_devices(document, root)?;
     Ok(changed)
+}
+
+fn migrate_theme_suffix_to_variant(document: &mut ConfigDocument) -> ConfigResult<bool> {
+    let Some(theme) = document.get("/appearance/theme").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(family) = theme.strip_suffix("-float") else {
+        return Ok(false);
+    };
+    document.set("/appearance/theme", Value::String(family.to_owned()))?;
+    if document.get("/layout/variant").is_none() {
+        document.set("/layout/variant", Value::String("float".into()))?;
+    }
+    Ok(true)
+}
+
+fn import_layout_state(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
+    let mut changed = false;
+    let spaces = resolved(root, ".spaces")
+        .map(|path| parse_legacy_pairs(&path))
+        .unwrap_or_default();
+    let borders = resolved(root, ".borders")
+        .map(|path| parse_legacy_pairs(&path))
+        .unwrap_or_default();
+    for (key, value) in spaces {
+        let pointer = match key.as_str() {
+            "gaps_in" => "/layout/window/gaps_in",
+            "gaps_out" => "/layout/window/gaps_out",
+            "gaps_out_top" => "/layout/window/gaps_out_top",
+            "gaps_out_left" => "/layout/window/gaps_out_left",
+            "gaps_out_right" => "/layout/window/gaps_out_right",
+            "gaps_out_bottom" => "/layout/window/gaps_out_bottom",
+            "waybar_pos" => "/layout/taskbar/position",
+            "waybar_top" => "/layout/taskbar/margin_top",
+            "waybar_left" => "/layout/taskbar/margin_left",
+            "waybar_right" => "/layout/taskbar/margin_right",
+            "waybar_bottom" => "/layout/taskbar/margin_bottom",
+            _ => continue,
+        };
+        let parsed = if pointer.ends_with("position") {
+            Value::String(value)
+        } else {
+            Value::Number(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ConfigError::Invalid(format!("invalid legacy layout value for {key}"))
+                    })?
+                    .into(),
+            )
+        };
+        if document.get(pointer).is_none() {
+            document.set(pointer, parsed)?;
+            changed = true;
+        }
+    }
+    for (key, value) in borders {
+        let pointer = match key.as_str() {
+            "rounded" => "/layout/window/rounded",
+            "rounding" => "/layout/window/rounding",
+            "thickness" => "/layout/window/border_size",
+            _ => continue,
+        };
+        let parsed = if pointer.ends_with("rounded") {
+            Value::Bool(value == "1" || value.eq_ignore_ascii_case("true"))
+        } else {
+            Value::Number(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ConfigError::Invalid(format!("invalid legacy border value for {key}"))
+                    })?
+                    .into(),
+            )
+        };
+        if document.get(pointer).is_none() {
+            document.set(pointer, parsed)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn parse_legacy_pairs(path: &Path) -> Vec<(String, String)> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect()
 }
 
 fn default_schema_version() -> u32 {
@@ -557,6 +819,9 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .entry("wallpaper")
         .or_insert_with(|| Value::String("/usr/share/backgrounds/argvus/argvus-dark.jxl".into()));
     object
+        .entry("wallpaper_custom")
+        .or_insert_with(|| Value::Bool(false));
+    object
         .entry("gtk_mode")
         .or_insert_with(|| Value::String("dark".into()));
     let theme = object
@@ -570,9 +835,47 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .entry("layout".into())
         .or_insert_with(|| Value::Object(Map::new()));
     let layout = layout.as_object_mut().expect("layout is object");
+    // Sticky/Float is independent of the theme (see `apply_layout_variant`);
+    // `theme` here only matters for the legacy `-float`-suffixed installs
+    // that `migrate_theme_suffix_to_variant` has not rewritten yet.
     layout
         .entry("variant")
         .or_insert_with(|| Value::String(theme_layout_variant(&theme).into()));
+    {
+        let taskbar = layout
+            .entry("taskbar")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("layout.taskbar is object");
+        for (key, value) in [
+            ("margin_bottom", Value::from(2)),
+            ("margin_left", Value::from(0)),
+            ("margin_right", Value::from(0)),
+            ("margin_top", Value::from(0)),
+            ("position", Value::String("top".into())),
+        ] {
+            taskbar.entry(key).or_insert(value);
+        }
+    }
+    {
+        let window = layout
+            .entry("window")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("layout.window is object");
+        for (key, value) in [
+            ("border_size", Value::from(1)),
+            ("gaps_in", Value::from(2)),
+            ("gaps_out_bottom", Value::from(0)),
+            ("gaps_out_left", Value::from(0)),
+            ("gaps_out_right", Value::from(0)),
+            ("gaps_out_top", Value::from(0)),
+            ("rounded", Value::Bool(false)),
+            ("rounding", Value::from(0)),
+        ] {
+            window.entry(key).or_insert(value);
+        }
+    }
 
     let effects = document
         .sections
@@ -582,11 +885,17 @@ fn apply_defaults(document: &mut ConfigDocument) {
     effects
         .entry("animations")
         .or_insert_with(|| Value::Bool(true));
+    effects
+        .entry("widget_telemetry_enabled")
+        .or_insert_with(|| Value::Bool(true));
+    effects
+        .entry("blur_global_enabled")
+        .or_insert_with(|| Value::Bool(true));
     for (surface, transparency) in [
-        ("taskbar", 90),
+        ("taskbar", 50),
         ("launchers", 50),
-        ("widget-telemetry", 90),
-        ("control-panel", 90),
+        ("widget-telemetry", 50),
+        ("control-panel", 50),
         ("terminal", 50),
         ("control-center", 50),
     ] {
@@ -694,8 +1003,45 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .entry("power".into())
         .or_insert_with(|| Value::Object(Map::new()));
     let power = power.as_object_mut().expect("power is object");
-    power.entry("lock_minutes").or_insert(15.into());
-    power.entry("screen_off_minutes").or_insert(30.into());
+    power.entry("lock_minutes").or_insert(30.into());
+    power.entry("screen_off_minutes").or_insert(0.into());
+    power
+        .entry("keep_awake")
+        .or_insert_with(|| Value::Bool(false));
+
+    let audio = document
+        .sections
+        .entry("audio".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let audio = audio.as_object_mut().expect("audio is object");
+    audio.entry("output_volume").or_insert(50.into());
+    audio
+        .entry("output_muted")
+        .or_insert_with(|| Value::Bool(false));
+}
+
+fn apply_packaged_defaults(document: &mut ConfigDocument) -> ConfigResult<()> {
+    let system_config = env::var_os("ARGVUS_SYSTEM_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/share/argvus"));
+    let defaults_root = system_config.join(MODULE_DIRECTORY);
+    for section in KNOWN_SECTIONS {
+        if document.sections.contains_key(section) {
+            continue;
+        }
+        let path = defaults_root.join(format!("{section}.json"));
+        if !path.is_file() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        if !value.is_object() {
+            return Err(ConfigError::Invalid(format!(
+                "section {section} must be a JSON object"
+            )));
+        }
+        document.sections.insert(section.to_owned(), value);
+    }
+    Ok(())
 }
 
 fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
@@ -974,6 +1320,28 @@ fn validate_power(document: &ConfigDocument) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_audio(document: &ConfigDocument) -> ConfigResult<()> {
+    let Some(audio) = document.sections.get("audio") else {
+        return Ok(());
+    };
+    if let Some(value) = audio.get("output_volume")
+        && value.as_u64().is_none_or(|volume| volume > 100)
+    {
+        return Err(ConfigError::Invalid(
+            "audio.output_volume must be an integer between 0 and 100".into(),
+        ));
+    }
+    if audio
+        .get("output_muted")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ConfigError::Invalid(
+            "audio.output_muted must be boolean".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_session(document: &ConfigDocument) -> ConfigResult<()> {
     if let Some(value) = document.sections.get("session")
         && value
@@ -1026,11 +1394,18 @@ fn validate_control_panel(document: &ConfigDocument) -> ConfigResult<()> {
     Ok(())
 }
 
-fn import_line(document: &mut ConfigDocument, pointer: &str, path: &Path) -> ConfigResult<bool> {
+fn import_line(
+    document: &mut ConfigDocument,
+    pointer: &str,
+    path: Option<PathBuf>,
+) -> ConfigResult<bool> {
+    let Some(path) = path else {
+        return Ok(false);
+    };
     if document.get(pointer).is_some() || !path.is_file() {
         return Ok(false);
     }
-    let value = fs::read_to_string(path)?
+    let value = fs::read_to_string(&path)?
         .lines()
         .next()
         .unwrap_or_default()
@@ -1043,20 +1418,14 @@ fn import_line(document: &mut ConfigDocument, pointer: &str, path: &Path) -> Con
     Ok(true)
 }
 
-fn import_raw(document: &mut ConfigDocument, pointer: &str, path: &Path) -> ConfigResult<bool> {
-    if document.get(pointer).is_some() || !path.is_file() {
+fn import_fonts(document: &mut ConfigDocument, path: Option<PathBuf>) -> ConfigResult<bool> {
+    let Some(path) = path else {
         return Ok(false);
-    }
-    let value = fs::read_to_string(path)?;
-    document.set(pointer, Value::String(value))?;
-    Ok(true)
-}
-
-fn import_fonts(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
+    };
     if !path.is_file() {
         return Ok(false);
     }
-    let legacy = fs::read_to_string(path)?;
+    let legacy = fs::read_to_string(&path)?;
     let state = legacy
         .lines()
         .filter_map(|line| line.trim().split_once('='))
@@ -1132,11 +1501,14 @@ fn import_fonts(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool
     Ok(changed)
 }
 
-fn import_defaults(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
+fn import_defaults(document: &mut ConfigDocument, path: Option<PathBuf>) -> ConfigResult<bool> {
     if document.get("/default_apps").is_some() {
         return Ok(false);
     }
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
         return Ok(false);
     };
     let value: Value = serde_json::from_str(&contents).map_err(ConfigError::InvalidJson)?;
@@ -1171,8 +1543,10 @@ fn import_keyboard_shortcuts(document: &mut ConfigDocument, root: &Path) -> Conf
     }
     let old_value = if let Some(value) = document.get("/hyprland/keybindings") {
         Some(value.clone())
+    } else if let Some(path) = resolved(root, "keybindings.toml") {
+        parse_keybindings_toml(&path)?
     } else {
-        parse_keybindings_toml(&root.join("keybindings.toml"))?
+        None
     };
     let Some(value) = old_value else {
         return Ok(false);
@@ -1230,7 +1604,7 @@ fn legacy_keybindings_to_shortcuts(value: &Value) -> Value {
     Value::Object(shortcuts)
 }
 
-fn config_key_for_binding(id: &str) -> String {
+pub(crate) fn config_key_for_binding(id: &str) -> String {
     match id {
         "window.close" => "close_window",
         "window.drag_mouse" => "drag_window__floating_window_only",
@@ -1274,52 +1648,78 @@ fn manifest_shortcut_defaults() -> BTreeMap<String, Value> {
     defaults
 }
 
+/// Destination of a pre-`data/` root entry, relative to the configuration root.
+///
+/// Every entry other than `config/` and `data/` itself belongs under `data/`.
+/// A few names already had a semantic home from an earlier migration and keep
+/// it; everything else follows the uniform `data/<name>` rule so a new
+/// component directory never has to be registered here.
+fn data_destination(name: &str) -> PathBuf {
+    match name {
+        ".config.lock" => PathBuf::from("data/internal/config.lock"),
+        "config.json.bak" => PathBuf::from("data/backups/config.json.bak"),
+        "defaults.json" => PathBuf::from("data/control-center/defaults.json"),
+        "keybindings.toml" => PathBuf::from("data/hypr/keybindings.toml"),
+        "input.toml" => PathBuf::from("data/hypr/input.toml"),
+        ".idle-timeout" | ".keep-awake" => PathBuf::from(format!("data/power/{name}")),
+        "fonts.conf" => PathBuf::from("data/generated/fonts.conf"),
+        "generated" => PathBuf::from("data/generated"),
+        "control-center" => PathBuf::from("data/control-center"),
+        // The legacy root `terminal/` directory already holds one subdirectory
+        // per terminal, so it maps onto `data/terminal/` itself. A standalone
+        // root `kitty/` directory belongs beside the others.
+        "terminal" => PathBuf::from("data/terminal"),
+        "kitty" => PathBuf::from("data/terminal/kitty"),
+        _ => PathBuf::from(format!("data/{name}")),
+    }
+}
+
+/// Resolve a migrated entry for reading, accepting the pre-`data/` root layout.
+///
+/// Migration runs after the legacy import, so a profile that has not been
+/// migrated yet still has its markers at the root. Prefer the managed location
+/// and fall back to the root so a single import pass works on both layouts.
+fn resolved(root: &Path, name: &str) -> Option<PathBuf> {
+    let managed = root.join(data_destination(name));
+    if managed.exists() {
+        return Some(managed);
+    }
+    let legacy = root.join(name);
+    if legacy.exists() {
+        return Some(legacy);
+    }
+    None
+}
+
 fn migrate_legacy_layout(root: &Path) -> ConfigResult<bool> {
     let data = root.join("data");
     fs::create_dir_all(data.join("internal"))?;
     fs::create_dir_all(data.join("backups"))?;
     let mut moved = false;
     let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, io::Error>>()?;
-    entries.sort_by_key(|entry| {
-        if entry.file_name() == "generated" {
-            0
-        } else {
-            1
-        }
+    // `generated` and `terminal` are parents of other migrated components, so
+    // they must be moved before their children; otherwise the child would find
+    // its destination already present and be diverted to `data/legacy`.
+    entries.sort_by_key(|entry| match entry.file_name().to_string_lossy().as_ref() {
+        "generated" => 0,
+        "terminal" => 1,
+        "kitty" => 2,
+        _ => 3,
     });
     for entry in entries {
         let source = entry.path();
         let name = entry.file_name();
-        if name == "config.json" || name == "data" {
+        if name == "config.json" || name == MODULE_DIRECTORY || name == "data" {
             continue;
         }
         let name = name.to_string_lossy();
+        let relative = data_destination(name.as_ref());
+        let destination = root.join(relative);
         if matches!(
             name.as_ref(),
-            ".active-theme" | ".gtk-mode" | ".wallpaper-custom" | ".spaces" | ".borders"
-        ) {
-            continue;
-        }
-        let relative = match name.as_ref() {
-            ".config.lock" => PathBuf::from("data/internal/config.lock"),
-            "config.json.bak" => PathBuf::from("data/backups/config.json.bak"),
-            "defaults.json" => PathBuf::from("data/control-center/defaults.json"),
-            "keybindings.toml" => PathBuf::from("data/hypr/keybindings.toml"),
-            "input.toml" => PathBuf::from("data/hypr/input.toml"),
-            ".idle-timeout" | ".keep-awake" => PathBuf::from(format!("data/power/{name}")),
-            "fonts.conf" => PathBuf::from("data/generated/fonts.conf"),
-            "generated" => PathBuf::from("data/generated"),
-            "control-center" => PathBuf::from("data/control-center"),
-            "state" => PathBuf::from("data/state"),
-            "hypr" => PathBuf::from("data/hypr"),
-            "waybar" => PathBuf::from("data/taskbar/waybar"),
-            "rofi" => PathBuf::from("data/launcher/rofi"),
-            "quickshell" => PathBuf::from("data/control-panel/quickshell"),
-            "terminal" | "kitty" | "foot" => PathBuf::from(format!("data/terminal/{name}")),
-            _ => PathBuf::from(format!("data/legacy/{name}")),
-        };
-        let destination = root.join(relative);
-        if matches!(name.as_ref(), "generated" | "control-center") && source.is_dir() {
+            "generated" | "control-center" | "terminal" | "kitty"
+        ) && source.is_dir()
+        {
             merge_legacy_tree(&source, &destination, &data.join("legacy"))?;
         } else if destination.exists() {
             let fallback = root.join("data/legacy").join(name.as_ref());
@@ -1382,11 +1782,14 @@ fn merge_legacy_tree(source: &Path, destination: &Path, legacy_root: &Path) -> C
     Ok(changed)
 }
 
-fn import_language(document: &mut ConfigDocument, path: &Path) -> ConfigResult<bool> {
+fn import_language(document: &mut ConfigDocument, path: Option<PathBuf>) -> ConfigResult<bool> {
     if document.get("/session/language").is_some() {
         return Ok(false);
     }
-    let Ok(value) = fs::read_to_string(path) else {
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let Ok(value) = fs::read_to_string(&path) else {
         return Ok(false);
     };
     let language = value.trim();
@@ -1403,14 +1806,17 @@ fn import_language(document: &mut ConfigDocument, path: &Path) -> ConfigResult<b
 fn import_power(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
     let mut changed = false;
     if document.get("/power/keep_awake").is_none()
-        && let Ok(value) = fs::read_to_string(root.join(".keep-awake"))
+        && let Some(path) = resolved(root, ".keep-awake")
+        && let Ok(value) = fs::read_to_string(&path)
         && value.trim() == "enabled"
     {
         document.set("/power/keep_awake", Value::Bool(true))?;
         changed = true;
     }
-    let path = root.join("hypr/hypridle.conf");
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(path) = resolved(root, "hypr/hypridle.conf") else {
+        return Ok(changed);
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
         return Ok(changed);
     };
     let mut timeout = None;
@@ -1448,8 +1854,10 @@ fn import_removable_devices(document: &mut ConfigDocument, root: &Path) -> Confi
     if document.get("/removable_devices").is_some() {
         return Ok(false);
     }
-    let path = root.join("removable-devices/config.json");
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(path) = resolved(root, "removable-devices/config.json") else {
+        return Ok(false);
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
         return Ok(false);
     };
     let value: Value =
@@ -1499,13 +1907,15 @@ fn strip_json_comments(contents: &str) -> String {
 fn import_hyprland(document: &mut ConfigDocument, root: &Path) -> ConfigResult<bool> {
     let mut changed = false;
     if document.get("/hyprland/input").is_none()
-        && let Some(value) = parse_input_toml(&root.join("input.toml"))?
+        && let Some(path) = resolved(root, "input.toml")
+        && let Some(value) = parse_input_toml(&path)?
     {
         document.set("/hyprland/input", value)?;
         changed = true;
     }
     if document.get("/hyprland/keyboard").is_none()
-        && let Some(value) = parse_keyboard_lua(&root.join("generated/hypr/input.lua"))?
+        && let Some(path) = resolved(root, "generated/hypr/input.lua")
+        && let Some(value) = parse_keyboard_lua(&path)?
     {
         document.set("/hyprland/keyboard", value)?;
         changed = true;
@@ -1517,7 +1927,10 @@ fn import_displays(document: &mut ConfigDocument, root: &Path) -> ConfigResult<b
     if document.get("/displays").is_some() {
         return Ok(false);
     }
-    let Ok(contents) = fs::read_to_string(root.join("generated/hypr/monitors.lua")) else {
+    let Some(path) = resolved(root, "generated/hypr/monitors.lua") else {
+        return Ok(false);
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
         return Ok(false);
     };
     let mut monitors = Map::new();
@@ -1961,7 +2374,7 @@ mod tests {
         assert_eq!(effects.get("animations"), Some(&Value::Bool(true)));
         assert_eq!(
             effects.get("transparency_taskbar_value"),
-            Some(&Value::Number(90.into()))
+            Some(&Value::Number(50.into()))
         );
         assert_eq!(
             effects.get("transparency_terminal_value"),
@@ -2009,7 +2422,7 @@ mod tests {
         };
 
         store.ensure().unwrap();
-        assert!(store.path.is_file());
+        assert!(store.module_directory().is_dir());
         let document = store.load().unwrap();
         assert_eq!(
             document.get("/appearance/theme").and_then(Value::as_str),
@@ -2060,8 +2473,8 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            config_directory.join("control-center/foot.ini"),
-            b"legacy-foot",
+            config_directory.join("control-center/legacy.ini"),
+            b"legacy-settings",
         )
         .unwrap();
         fs::write(
@@ -2088,8 +2501,8 @@ mod tests {
             b"legacy-theme"
         );
         assert_eq!(
-            fs::read(config_directory.join("data/control-center/foot.ini")).unwrap(),
-            b"legacy-foot"
+            fs::read(config_directory.join("data/control-center/legacy.ini")).unwrap(),
+            b"legacy-settings"
         );
 
         let first_tree = fs::read_dir(config_directory.join("data"))
@@ -2103,6 +2516,170 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first_tree, second_tree);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ensure_leaves_only_config_and_data_at_the_configuration_root() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-root-layout",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        fs::create_dir_all(&config_directory).unwrap();
+        for name in [
+            "hypr",
+            "waybar",
+            "rofi",
+            "dunst",
+            "quickshell",
+            "gtk-3.0",
+            "gtk-4.0",
+            "qt6ct",
+            "yazi",
+            "superfile",
+            "state",
+            "taskbar",
+            "display",
+            "control-panel",
+        ] {
+            fs::create_dir_all(config_directory.join(name)).unwrap();
+            fs::write(config_directory.join(name).join("marker"), b"managed").unwrap();
+        }
+        for (name, contents) in [
+            (".active-theme", "argvus-dark\n"),
+            (".accent-color", "#112233\n"),
+            (".gtk-mode", "dark\n"),
+            (".spaces", "gaps_in=2\n"),
+            (".borders", "rounded=0\n"),
+            (".monitors", "DP-1,auto,1,auto\n"),
+            (".keep-awake", "enabled\n"),
+            (".weather-location", "Sao Paulo\n"),
+        ] {
+            fs::write(config_directory.join(name), contents).unwrap();
+        }
+
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+        store.ensure().unwrap();
+
+        // Everything the resolver owns must land in its semantic destination.
+        for name in [
+            "terminal",
+            "kitty",
+            "generated",
+            "control-center",
+            "waybar",
+            "state",
+        ] {
+            fs::create_dir_all(config_directory.join(name)).unwrap();
+        }
+        fs::write(config_directory.join("terminal/marker"), b"terminal").unwrap();
+        fs::write(config_directory.join("kitty/marker"), b"kitty").unwrap();
+        fs::write(config_directory.join("generated/marker"), b"generated").unwrap();
+        fs::write(config_directory.join("control-center/marker"), b"cc").unwrap();
+        fs::write(config_directory.join("defaults.json"), b"{}\n").unwrap();
+        fs::write(config_directory.join("keybindings.toml"), b"k\n").unwrap();
+        fs::write(config_directory.join("input.toml"), b"i\n").unwrap();
+        fs::write(config_directory.join("fonts.conf"), b"f\n").unwrap();
+        fs::write(config_directory.join(".idle-timeout"), b"t\n").unwrap();
+        store.ensure().unwrap();
+
+        let mut remaining = fs::read_dir(&config_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, vec!["config", "data"]);
+
+        // Directories and marker files keep their names one level deeper.
+        assert_eq!(
+            fs::read(config_directory.join("data/waybar/marker")).unwrap(),
+            b"managed"
+        );
+        assert_eq!(
+            fs::read(config_directory.join("data/.active-theme")).unwrap(),
+            b"argvus-dark\n"
+        );
+        assert_eq!(
+            fs::read(config_directory.join("data/power/.keep-awake")).unwrap(),
+            b"enabled\n"
+        );
+
+        // Semantic exceptions keep their dedicated destination.
+        for relative in [
+            // The legacy `terminal/` component becomes `data/terminal/`, and a
+            // standalone root `kitty/` sits beside the other terminals.
+            "data/terminal/marker",
+            "data/terminal/kitty/marker",
+            "data/generated/marker",
+            "data/generated/fonts.conf",
+            "data/control-center/marker",
+            "data/control-center/defaults.json",
+            "data/hypr/keybindings.toml",
+            "data/hypr/input.toml",
+            "data/power/.idle-timeout",
+        ] {
+            assert!(
+                config_directory.join(relative).exists(),
+                "expected {relative} after migration"
+            );
+        }
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn migration_keeps_terminal_components_nested_and_unstranded() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-terminal-layout",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+
+        // The legacy root `terminal/` already nests one directory per terminal.
+        fs::create_dir_all(config_directory.join("terminal/kitty")).unwrap();
+        fs::create_dir_all(config_directory.join("terminal/kitty-tui")).unwrap();
+        fs::write(
+            config_directory.join("terminal/kitty/kitty.conf"),
+            b"nested",
+        )
+        .unwrap();
+        // A standalone root `kitty/` must land beside the others, not be
+        // stranded in `data/legacy` because `data/terminal/` already exists.
+        fs::create_dir_all(config_directory.join("kitty")).unwrap();
+        fs::write(config_directory.join("kitty/custom.conf"), b"standalone").unwrap();
+
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+        store.ensure().unwrap();
+
+        assert_eq!(
+            fs::read(config_directory.join("data/terminal/kitty/kitty.conf")).unwrap(),
+            b"nested"
+        );
+        assert!(config_directory.join("data/terminal/kitty-tui").is_dir());
+        // The standalone directory merges into the terminal tree, and no
+        // component is diverted to the legacy fallback.
+        assert_eq!(
+            fs::read(config_directory.join("data/terminal/kitty/custom.conf")).unwrap(),
+            b"standalone"
+        );
+        assert!(!config_directory.join("data/legacy/kitty").exists());
+        assert!(!config_directory.join("data/legacy/terminal").exists());
+
+        let mut remaining = fs::read_dir(&config_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, vec!["config", "data"]);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -2153,6 +2730,7 @@ mod tests {
                 Some("dark"),
                 Some("/usr/share/backgrounds/universe.jxl"),
                 false,
+                false,
             )
             .unwrap();
         let document = store.load().unwrap();
@@ -2165,6 +2743,24 @@ mod tests {
             Some("sticky")
         );
         assert_eq!(
+            document
+                .get("/layout/window/gaps_in")
+                .and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            document
+                .get("/layout/window/rounded")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            document
+                .get("/layout/taskbar/margin_bottom")
+                .and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
             document.get("/appearance/accent").and_then(Value::as_str),
             Some("#ABCDEF")
         );
@@ -2173,6 +2769,65 @@ mod tests {
                 .get("/appearance/wallpaper")
                 .and_then(Value::as_str),
             Some("/tmp/custom.jxl")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn apply_theme_resets_custom_accent_only_when_requested() {
+        let directory = env::temp_dir().join(format!(
+            "argvus-config-test-{}-accent-reset",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config_directory = directory.join("argvus");
+        let store = ConfigStore {
+            path: config_directory.join("config.json"),
+            lock_path: config_directory.join(LOCK_FILE),
+        };
+        store.ensure().unwrap();
+        let mut patch = Map::new();
+        patch.insert("/appearance/accent".into(), Value::String("#ABCDEF".into()));
+        patch.insert("/appearance/accent_custom".into(), Value::Bool(true));
+        store.patch(&patch).unwrap();
+
+        // A projection that does not request the reset keeps the override.
+        store
+            .apply_theme(
+                "universe",
+                Some("#EEEEEE"),
+                Some("dark"),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let document = store.load().unwrap();
+        assert_eq!(
+            document.get("/appearance/accent").and_then(Value::as_str),
+            Some("#ABCDEF")
+        );
+        assert_eq!(
+            document
+                .get("/appearance/accent_custom")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Selecting an official theme clears the override so the theme wins.
+        store
+            .apply_theme("dracula", Some("#AAAAAA"), Some("dark"), None, false, true)
+            .unwrap();
+        let document = store.load().unwrap();
+        assert_eq!(
+            document.get("/appearance/accent").and_then(Value::as_str),
+            Some("#AAAAAA")
+        );
+        assert_eq!(
+            document
+                .get("/appearance/accent_custom")
+                .and_then(Value::as_bool),
+            Some(false)
         );
         fs::remove_dir_all(directory).unwrap();
     }

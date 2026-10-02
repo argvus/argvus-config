@@ -83,6 +83,51 @@
         "blur_control-center_enabled": { "type": "boolean" }
       }
     },
+    "taskbar": {
+      "type": "object",
+      "properties": {
+        "icons": {
+          "type": "object",
+          "properties": {
+            "audio_player_enabled": { "type": "boolean" },
+            "launcher_enabled": { "type": "boolean" },
+            "network_enabled": { "type": "boolean" },
+            "power_profile_enabled": { "type": "boolean" },
+            "keyboard_layout_enabled": { "type": "boolean" },
+            "memory_enabled": { "type": "boolean" },
+            "cpu_enabled": { "type": "boolean" },
+            "cpu_temperature_enabled": { "type": "boolean" },
+            "gpu_temperature_enabled": { "type": "boolean" },
+            "utilities": {
+              "type": "object",
+              "properties": {
+                "expanded": { "type": "boolean" }
+              }
+            }
+          }
+        },
+        "date": {
+          "type": "object",
+          "properties": {
+            "format": {
+              "enum": [
+                "weekday_day_month",
+                "weekday_day_month_year",
+                "weekday_day_slash_month_year",
+                "numeric_short_locale_aware"
+              ]
+            }
+          }
+        },
+        "time": {
+          "type": "object",
+          "properties": {
+            "seconds_enabled": { "type": "boolean" },
+            "format": { "enum": ["24h", "12h"] }
+          }
+        }
+      }
+    },
     "fonts": {
       "type": "object",
       "properties": {

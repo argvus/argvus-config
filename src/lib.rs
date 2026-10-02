@@ -21,7 +21,7 @@ const LOCK_FILE: &str = "data/internal/config.lock";
 const BACKUP_FILE: &str = "data/backups/config.json.bak";
 const MODULE_DIRECTORY: &str = "config";
 
-const KNOWN_SECTIONS: [&str; 14] = [
+const KNOWN_SECTIONS: [&str; 15] = [
     "appearance",
     "layout",
     "effects",
@@ -36,6 +36,7 @@ const KNOWN_SECTIONS: [&str; 14] = [
     "calendar",
     "removable_devices",
     "audio",
+    "taskbar",
 ];
 
 #[derive(Debug, Error)]
@@ -86,7 +87,14 @@ impl ConfigScope {
 
     pub fn sections(self) -> &'static [&'static str] {
         match self {
-            Self::Appearance => &["appearance", "layout", "effects", "fonts", "control_panel"],
+            Self::Appearance => &[
+                "appearance",
+                "layout",
+                "effects",
+                "fonts",
+                "control_panel",
+                "taskbar",
+            ],
             Self::Desktop => &[
                 "appearance",
                 "layout",
@@ -102,6 +110,7 @@ impl ConfigScope {
                 "calendar",
                 "removable_devices",
                 "audio",
+                "taskbar",
             ],
         }
     }
@@ -154,6 +163,7 @@ impl ConfigDocument {
         validate_power(self)?;
         validate_audio(self)?;
         validate_session(self)?;
+        validate_taskbar(self)?;
         Ok(())
     }
 
@@ -922,6 +932,58 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .entry("blur_control-center_enabled")
         .or_insert_with(|| Value::Bool(true));
 
+    let taskbar = document
+        .sections
+        .entry("taskbar".into())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let taskbar = taskbar.as_object_mut().expect("taskbar is object");
+    let icons = taskbar
+        .entry("icons")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let icons = icons.as_object_mut().expect("taskbar.icons is object");
+    icons
+        .entry("audio_player_enabled")
+        .or_insert_with(|| Value::Bool(true));
+    icons
+        .entry("launcher_enabled")
+        .or_insert_with(|| Value::Bool(true));
+    for widget in [
+        "network",
+        "power_profile",
+        "keyboard_layout",
+        "memory",
+        "cpu",
+        "cpu_temperature",
+        "gpu_temperature",
+    ] {
+        icons
+            .entry(format!("{widget}_enabled"))
+            .or_insert_with(|| Value::Bool(true));
+    }
+    let utilities = icons
+        .entry("utilities")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let utilities = utilities
+        .as_object_mut()
+        .expect("taskbar.icons.utilities is object");
+    utilities
+        .entry("expanded")
+        .or_insert_with(|| Value::Bool(true));
+    let date = taskbar
+        .entry("date")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let date = date.as_object_mut().expect("taskbar.date is object");
+    date.entry("format")
+        .or_insert_with(|| Value::String("weekday_day_month".into()));
+    let time = taskbar
+        .entry("time")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let time = time.as_object_mut().expect("taskbar.time is object");
+    time.entry("seconds_enabled")
+        .or_insert_with(|| Value::Bool(false));
+    time.entry("format")
+        .or_insert_with(|| Value::String("24h".into()));
+
     let default_apps = document
         .sections
         .entry("default_apps".into())
@@ -1123,6 +1185,32 @@ fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
                 "effects.{key} must be between 0 and 100"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_taskbar(document: &ConfigDocument) -> ConfigResult<()> {
+    if let Some(format) = document.get("/taskbar/date/format").and_then(Value::as_str)
+        && !matches!(
+            format,
+            "weekday_day_month"
+                | "weekday_day_month_year"
+                | "weekday_day_slash_month_year"
+                | "numeric_short_locale_aware"
+        )
+    {
+        return Err(ConfigError::Invalid(format!(
+            "taskbar.date.format must be one of weekday_day_month, \
+             weekday_day_month_year, weekday_day_slash_month_year, \
+             numeric_short_locale_aware (got {format})"
+        )));
+    }
+    if let Some(format) = document.get("/taskbar/time/format").and_then(Value::as_str)
+        && !matches!(format, "24h" | "12h")
+    {
+        return Err(ConfigError::Invalid(format!(
+            "taskbar.time.format must be 24h or 12h (got {format})"
+        )));
     }
     Ok(())
 }

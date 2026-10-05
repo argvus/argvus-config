@@ -445,6 +445,17 @@ fn project_control_panel(document: &ConfigDocument, paths: &ArgvusPaths) -> Conf
 /// Projects the canonical layout values into the compatibility inputs consumed
 /// by the official Hyprland spacing and border adapters. These files remain
 /// derived state; the modular configuration files are the only persistent source of truth.
+/// Compute the effective rounding value.
+/// When `rounded` is false (disabled), rounding must be 0 regardless of the configured value.
+/// When `rounded` is true, clamp rounding to the valid range [2..10].
+fn effective_rounding(rounded: bool, rounding: u64) -> u64 {
+    if !rounded {
+        0
+    } else {
+        rounding.clamp(2, 10)
+    }
+}
+
 fn project_layout(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {
     let Some(layout) = document.get("/layout").and_then(Value::as_object) else {
         return Ok(());
@@ -474,18 +485,21 @@ fn project_layout(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResul
         }
 
         let mut border_lines = Vec::new();
+        let rounded = window
+            .get("rounded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if let Some(value) = window.get("rounded").and_then(Value::as_bool) {
             border_lines.push(format!("rounded={}", u8::from(value)));
         }
-        for key in ["rounding", "border_size"] {
-            if let Some(value) = window.get(key).and_then(Value::as_u64) {
-                let runtime_key = if key == "border_size" {
-                    "thickness"
-                } else {
-                    key
-                };
-                border_lines.push(format!("{runtime_key}={value}"));
-            }
+        // Use effective rounding: when rounded is false, force rounding to 0
+        let rounding = window.get("rounding").and_then(Value::as_u64).unwrap_or(0);
+        let effective_rounding_value = effective_rounding(rounded, rounding);
+        border_lines.push(format!("rounding={effective_rounding_value}"));
+
+        // border_size (mapped to thickness) is independent of rounded state
+        if let Some(value) = window.get("border_size").and_then(Value::as_u64) {
+            border_lines.push(format!("thickness={value}"));
         }
         if !border_lines.is_empty() {
             atomic_write(
@@ -1048,6 +1062,102 @@ mod tests {
         let native = fs::read_to_string(root.join("data/hypr/hyprpaper.conf"))
             .expect("native wallpaper file exists");
         assert!(native.contains("path = /usr/share/backgrounds/argvus/argvus-dark.jxl"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effective_rounding_is_zero_when_rounded_is_false() {
+        assert_eq!(effective_rounding(false, 0), 0);
+        assert_eq!(effective_rounding(false, 4), 0);
+        assert_eq!(effective_rounding(false, 8), 0);
+        assert_eq!(effective_rounding(false, 10), 0);
+    }
+
+    #[test]
+    fn effective_rounding_clamps_to_valid_range_when_rounded_is_true() {
+        // Below minimum (2)
+        assert_eq!(effective_rounding(true, 0), 2);
+        assert_eq!(effective_rounding(true, 1), 2);
+        // Within range
+        assert_eq!(effective_rounding(true, 2), 2);
+        assert_eq!(effective_rounding(true, 5), 5);
+        assert_eq!(effective_rounding(true, 10), 10);
+        // Above maximum (10)
+        assert_eq!(effective_rounding(true, 11), 10);
+        assert_eq!(effective_rounding(true, 100), 10);
+    }
+
+    #[test]
+    fn layout_projection_ignores_rounding_when_rounded_is_false() {
+        let root = env::temp_dir().join(format!("argvus-borders-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = ArgvusPaths {
+            data: root.join("data"),
+            generated: root.join("data/generated"),
+            internal: root.join("data/internal"),
+            backups: root.join("data/backups"),
+            projection_manifest: root.join("state/config-projection.json"),
+            root: root.clone(),
+        };
+        let mut document = ConfigDocument::default();
+        document
+            .set("/layout/window/rounded", Value::Bool(false))
+            .expect("valid rounded value");
+        document
+            .set("/layout/window/rounding", Value::from(8))
+            .expect("valid rounding value");
+        document
+            .set("/layout/window/border_size", Value::from(1))
+            .expect("valid border_size value");
+
+        project_layout(&document, &paths).expect("layout projection succeeds");
+        let borders = fs::read_to_string(root.join("data/.borders")).expect(".borders file exists");
+        assert!(borders.contains("rounded=0"), "rounded should be 0");
+        assert!(
+            borders.contains("rounding=0"),
+            "rounding should be forced to 0 when rounded=false"
+        );
+        assert!(
+            borders.contains("thickness=1"),
+            "thickness should be preserved"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn layout_projection_respects_rounding_when_rounded_is_true() {
+        let root = env::temp_dir().join(format!("argvus-borders-true-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = ArgvusPaths {
+            data: root.join("data"),
+            generated: root.join("data/generated"),
+            internal: root.join("data/internal"),
+            backups: root.join("data/backups"),
+            projection_manifest: root.join("state/config-projection.json"),
+            root: root.clone(),
+        };
+        let mut document = ConfigDocument::default();
+        document
+            .set("/layout/window/rounded", Value::Bool(true))
+            .expect("valid rounded value");
+        document
+            .set("/layout/window/rounding", Value::from(5))
+            .expect("valid rounding value");
+        document
+            .set("/layout/window/border_size", Value::from(1))
+            .expect("valid border_size value");
+
+        project_layout(&document, &paths).expect("layout projection succeeds");
+        let borders = fs::read_to_string(root.join("data/.borders")).expect(".borders file exists");
+        assert!(borders.contains("rounded=1"), "rounded should be 1");
+        assert!(
+            borders.contains("rounding=5"),
+            "rounding should be preserved when rounded=true"
+        );
+        assert!(
+            borders.contains("thickness=1"),
+            "thickness should be preserved"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

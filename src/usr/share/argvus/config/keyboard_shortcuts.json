@@ -3,6 +3,7 @@
   "app_file_manager": "SUPER + Space",
   "app_launcher": "SUPER + D",
   "app_removable_devices": "SUPER + SHIFT + D",
+  "app_scratchpad": "SUPER + bracketleft",
   "app_terminal": "SUPER + Return",
   "appearance_animations": "SUPER + F6",
   "appearance_brightness": "SUPER + SHIFT + B",

@@ -184,6 +184,7 @@
       "type": "object",
       "properties": {
         "keybindings": { "type": "object" },
+        "window_rules": { "type": "object" },
         "input": { "type": "object" },
         "keyboard": { "type": "object" }
       }

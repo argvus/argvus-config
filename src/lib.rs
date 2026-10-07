@@ -21,7 +21,7 @@ const LOCK_FILE: &str = "data/internal/config.lock";
 const BACKUP_FILE: &str = "data/backups/config.json.bak";
 const MODULE_DIRECTORY: &str = "config";
 
-const KNOWN_SECTIONS: [&str; 15] = [
+const KNOWN_SECTIONS: [&str; 16] = [
     "appearance",
     "layout",
     "effects",
@@ -37,6 +37,7 @@ const KNOWN_SECTIONS: [&str; 15] = [
     "removable_devices",
     "audio",
     "taskbar",
+    "projects",
 ];
 
 #[derive(Debug, Error)]
@@ -111,6 +112,7 @@ impl ConfigScope {
                 "removable_devices",
                 "audio",
                 "taskbar",
+                "projects",
             ],
         }
     }
@@ -186,7 +188,7 @@ impl ConfigDocument {
             if index == 0 {
                 current = object.get(&key);
             } else {
-                current = current?.get(&key);
+                current = child_value(current?, &key);
             }
         }
         current
@@ -758,6 +760,14 @@ fn parse_legacy_pairs(path: &Path) -> Vec<(String, String)> {
 
 fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
+}
+
+/// Resolves one JSON Pointer segment, using numeric segments as array indexes.
+fn child_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Array(items) => key.parse::<usize>().ok().and_then(|index| items.get(index)),
+        other => other.get(key),
+    }
 }
 
 fn pointer_components(pointer: &str) -> ConfigResult<Vec<String>> {
@@ -2253,6 +2263,25 @@ impl Drop for LockGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_resolves_array_index_pointers() {
+        let mut document = ConfigDocument::default();
+        document.sections.insert(
+            "projects".to_owned(),
+            serde_json::json!({ "roots": ["~/Projects", "~/Work"] }),
+        );
+        assert_eq!(
+            document.get("/projects/roots/0"),
+            Some(&Value::String("~/Projects".to_owned()))
+        );
+        assert_eq!(
+            document.get("/projects/roots/1"),
+            Some(&Value::String("~/Work".to_owned()))
+        );
+        assert_eq!(document.get("/projects/roots/2"), None);
+        assert_eq!(document.get("/projects/roots/x"), None);
+    }
 
     #[test]
     fn updates_nested_values_and_validates_accent() {

@@ -214,6 +214,20 @@
     },
     "calendar": { "type": "object" },
     "removable_devices": { "type": "object" },
+    "projects": {
+      "type": "object",
+      "properties": {
+        "roots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "editor": { "type": "string" }
+      }
+    },
     "audio": {
       "type": "object",
       "properties": {

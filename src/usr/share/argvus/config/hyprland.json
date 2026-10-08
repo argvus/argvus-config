@@ -1,14 +1,5 @@
 {
-  "window_rules": {
-    "browser": {
-      "workspace": 2,
-      "classes": ["firefox.*", "chromium.*", "google-chrome.*", "brave-browser.*", "librewolf.*", "zen-browser.*"]
-    },
-    "ide": {
-      "workspace": 1,
-      "classes": ["[Cc]ode.*", "cursor", "jetbrains-.*", "dev.zed.Zed"]
-    }
-  },
+  "window_rules": {},
   "input": {
     "mouse": {
       "accel_profile": "flat",

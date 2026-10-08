@@ -956,7 +956,10 @@ fn apply_defaults(document: &mut ConfigDocument) {
         .or_insert_with(|| Value::Bool(true));
     icons
         .entry("launcher_enabled")
-        .or_insert_with(|| Value::Bool(true));
+        .or_insert_with(|| Value::Bool(false));
+    icons
+        .entry("launcher_custom_icon_path")
+        .or_insert(Value::Null);
     for widget in [
         "network",
         "power_profile",

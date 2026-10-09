@@ -21,7 +21,7 @@ const LOCK_FILE: &str = "data/internal/config.lock";
 const BACKUP_FILE: &str = "data/backups/config.json.bak";
 const MODULE_DIRECTORY: &str = "config";
 
-const KNOWN_SECTIONS: [&str; 16] = [
+const KNOWN_SECTIONS: [&str; 17] = [
     "appearance",
     "layout",
     "effects",
@@ -38,6 +38,7 @@ const KNOWN_SECTIONS: [&str; 16] = [
     "audio",
     "taskbar",
     "projects",
+    "snippets",
 ];
 
 #[derive(Debug, Error)]

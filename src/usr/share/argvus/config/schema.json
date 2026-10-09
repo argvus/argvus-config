@@ -229,6 +229,22 @@
         "editor": { "type": "string" }
       }
     },
+    "snippets": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "content": { "type": "string" }
+            },
+            "required": ["name", "content"]
+          }
+        }
+      }
+    },
     "audio": {
       "type": "object",
       "properties": {

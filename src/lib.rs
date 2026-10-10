@@ -927,9 +927,17 @@ fn apply_defaults(document: &mut ConfigDocument) {
             .entry(format!("transparency_{surface}_value"))
             .or_insert_with(|| Value::Number(transparency.into()));
     }
-    effects
-        .entry("blur_global_value")
-        .or_insert_with(|| Value::Number(50.into()));
+    for (key, value) in BLUR_SETTINGS_DEFAULTS {
+        effects.entry(key).or_insert_with(|| {
+            // Whole defaults are written as integers, like effects.json, so the
+            // integer fields (size, passes) read back without a fractional part.
+            if value.fract() == 0.0 {
+                Value::from(value as i64)
+            } else {
+                Value::from(value)
+            }
+        });
+    }
     effects
         .entry("transparency_control-center_enabled")
         .or_insert_with(|| Value::Bool(true));
@@ -1189,12 +1197,42 @@ fn validate_layout(document: &ConfigDocument) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Hyprland blur parameters stored under `effects`. Each entry is the key, the
+/// inclusive range accepted by the schema and whether it must be an integer.
+const BLUR_SETTINGS: [(&str, f64, f64, bool); 7] = [
+    ("blur_size", 1.0, 64.0, true),
+    ("blur_passes", 1.0, 8.0, true),
+    ("blur_brightness", 0.0, 2.0, false),
+    ("blur_noise", 0.0, 1.0, false),
+    ("blur_contrast", 0.0, 2.0, false),
+    ("blur_vibrancy", 0.0, 1.0, false),
+    ("blur_vibrancy_darkness", 0.0, 1.0, false),
+];
+
+/// Defaults written into new profiles. They match Hyprland's blur parameters
+/// as shown in the Control Center and must stay in sync with `effects.json`.
+const BLUR_SETTINGS_DEFAULTS: [(&str, f64); 7] = [
+    ("blur_size", 6.0),
+    ("blur_passes", 2.0),
+    ("blur_brightness", 1.0),
+    ("blur_noise", 0.0),
+    ("blur_contrast", 0.9),
+    ("blur_vibrancy", 0.1),
+    ("blur_vibrancy_darkness", 0.0),
+];
+
 fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
     let Some(effects) = document.sections.get("effects") else {
         return Ok(());
     };
     for (key, value) in effects.as_object().expect("validated section object") {
         if value.is_boolean() {
+            continue;
+        }
+        if let Some((_, minimum, maximum, integer)) =
+            BLUR_SETTINGS.iter().find(|(name, ..)| name == key)
+        {
+            validate_blur_setting(key, value, *minimum, *maximum, *integer)?;
             continue;
         }
         let Some(number) = value.as_i64() else {
@@ -1207,6 +1245,32 @@ fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
                 "effects.{key} must be between 0 and 100"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_blur_setting(
+    key: &str,
+    value: &Value,
+    minimum: f64,
+    maximum: f64,
+    integer: bool,
+) -> ConfigResult<()> {
+    let number = value.as_f64().filter(|number| number.is_finite());
+    let Some(number) = number else {
+        return Err(ConfigError::Invalid(format!(
+            "effects.{key} must be a number between {minimum} and {maximum}"
+        )));
+    };
+    if integer && number.fract() != 0.0 {
+        return Err(ConfigError::Invalid(format!(
+            "effects.{key} must be an integer between {minimum} and {maximum}"
+        )));
+    }
+    if !(minimum..=maximum).contains(&number) {
+        return Err(ConfigError::Invalid(format!(
+            "effects.{key} must be between {minimum} and {maximum}"
+        )));
     }
     Ok(())
 }
@@ -2517,10 +2581,13 @@ mod tests {
             effects.get("transparency_control-center_value"),
             Some(&Value::Number(50.into()))
         );
+        assert_eq!(effects.get("blur_size").and_then(Value::as_f64), Some(6.0));
         assert_eq!(
-            effects.get("blur_global_value"),
-            Some(&Value::Number(50.into()))
+            effects.get("blur_passes").and_then(Value::as_f64),
+            Some(2.0)
         );
+        assert_eq!(effects.get("blur_contrast"), Some(&Value::from(0.9)));
+        assert!(effects.get("blur_global_value").is_none());
         assert_eq!(
             effects.get("blur_control-center_enabled"),
             Some(&Value::Bool(true))

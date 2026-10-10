@@ -1,0 +1,201 @@
+name: Arch package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build and publish Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            cargo \
+            git \
+            gnupg \
+            pacman-contrib \
+            pkgconf \
+            rust \
+            sudo
+
+      - name: Prepare build user
+        run: |
+          useradd --create-home --shell /bin/bash builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Prepare PKGBUILD version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*([._+-][A-Za-z0-9]+)*$ ]]; then
+            echo "Unsupported version tag: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ -n "$cargo_version" && "$cargo_version" != "$version" ]]; then
+            echo "Cargo.toml version (${cargo_version}) does not match tag (${version})." >&2
+            exit 1
+          fi
+
+          sed -i "s/^pkgver=.*/pkgver=${version}/" "packaging/arch/ci/PKGBUILD"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if make -n validate >/dev/null 2>&1; then
+            make validate
+          else
+            echo "No make validate target; skipping repository validation."
+          fi
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo -u builder env GITHUB_WORKSPACE="$GITHUB_WORKSPACE" bash -lc \
+            'cd "$GITHUB_WORKSPACE/packaging/arch/ci" && makepkg --nodeps --noconfirm --needed --cleanbuild --clean'
+
+          pkg_file="$(find "packaging/arch/ci" -maxdepth 1 -type f -name 'argvus-config-*.pkg.tar.zst' -print -quit)"
+          if [[ -z "$pkg_file" ]]; then
+            echo "Package file was not created." >&2
+            exit 1
+          fi
+
+          {
+            echo "pkg_file=${pkg_file}"
+            echo "pkg_name=$(basename "$pkg_file")"
+            echo "pkg_sig_file=${pkg_file}.sig"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign package
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          [ -n "${GPG_PRIVATE_KEY:-}" ] || { echo "::error::GPG_PRIVATE_KEY secret is not set"; exit 1; }
+          [ -n "${GPG_PASSPHRASE:-}" ] || { echo "::error::GPG_PASSPHRASE secret is not set"; exit 1; }
+          [ -n "${GPG_KEY_ID:-}" ] || { echo "::error::GPG_KEY_ID secret is not set"; exit 1; }
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          IMPORTED_GPG_KEY_ID="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^sec:/ { print $5; exit }')"
+          [ -n "$IMPORTED_GPG_KEY_ID" ] || { echo "::error::No secret GPG key was imported"; exit 1; }
+          IMPORTED_GPG_FINGERPRINT="$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [ "$IMPORTED_GPG_KEY_ID" = "$GPG_KEY_ID" ] || [ "$IMPORTED_GPG_FINGERPRINT" = "$GPG_KEY_ID" ] || { echo "::error::Imported GPG key does not match GPG_KEY_ID"; exit 1; }
+
+          rm -f "${pkg_file}.sig"
+          printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --local-user "$GPG_KEY_ID" --detach-sign "$pkg_file"
+
+      - name: Verify package signature
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          [ -n "${GPG_PRIVATE_KEY:-}" ] || { echo "::error::GPG_PRIVATE_KEY secret is not set"; exit 1; }
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+          gpg --batch --verify "${pkg_sig_file}" "${pkg_file}"
+
+      - name: Upload temporary package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.pkg_name }}
+          path: |
+            ${{ env.pkg_file }}
+            ${{ env.pkg_sig_file }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Checkout packages repository
+        uses: actions/checkout@v4
+        with:
+          repository: argvus/packages
+          path: packages-repo
+          token: ${{ secrets.PACKAGES_REPO_TOKEN }}
+
+      - name: Publish package to argvus/packages
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+
+          [ -n "${GPG_PRIVATE_KEY:-}" ] || { echo "::error::GPG_PRIVATE_KEY secret is not set"; exit 1; }
+          [ -n "${GPG_PASSPHRASE:-}" ] || { echo "::error::GPG_PASSPHRASE secret is not set"; exit 1; }
+          [ -n "${GPG_KEY_ID:-}" ] || { echo "::error::GPG_KEY_ID secret is not set"; exit 1; }
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          IMPORTED_GPG_KEY_ID="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^sec:/ { print $5; exit }')"
+          [ -n "$IMPORTED_GPG_KEY_ID" ] || { echo "::error::No secret GPG key was imported"; exit 1; }
+          IMPORTED_GPG_FINGERPRINT="$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [ "$IMPORTED_GPG_KEY_ID" = "$GPG_KEY_ID" ] || [ "$IMPORTED_GPG_FINGERPRINT" = "$GPG_KEY_ID" ] || { echo "::error::Imported GPG key does not match GPG_KEY_ID"; exit 1; }
+
+          gpg_sign() {
+            local target="$1"
+            rm -f "${target}.sig"
+            printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --local-user "$GPG_KEY_ID" --detach-sign "$target"
+          }
+
+          repo_dir="$GITHUB_WORKSPACE/packages-repo/public/arch/x86_64"
+          mkdir -p "$repo_dir"
+          cp "$GITHUB_WORKSPACE/${pkg_file}" "$repo_dir/${pkg_name}"
+          cp "$GITHUB_WORKSPACE/${pkg_sig_file}" "$repo_dir/${pkg_name}.sig"
+
+          cd "$repo_dir"
+          repo-add -R argvus.db.tar.gz "$pkg_name"
+          gpg_sign argvus.db.tar.gz
+          gpg_sign argvus.files.tar.gz
+          gpg_sign argvus.db
+          gpg_sign argvus.files
+
+          cd "$GITHUB_WORKSPACE/packages-repo"
+          git config --global --add safe.directory "$PWD"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/arch/x86_64
+
+          if git diff --cached --quiet -- public/arch/x86_64; then
+            echo "No package repository changes to publish."
+            exit 0
+          fi
+
+          git commit -m "Publish argvus-config ${{ steps.version.outputs.version }}"
+          git push

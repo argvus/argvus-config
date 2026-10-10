@@ -926,9 +926,6 @@ fn apply_defaults(document: &mut ConfigDocument) {
         effects
             .entry(format!("transparency_{surface}_value"))
             .or_insert_with(|| Value::Number(transparency.into()));
-        effects
-            .entry(format!("blur_{surface}_enabled"))
-            .or_insert_with(|| Value::Bool(true));
     }
     effects
         .entry("blur_global_value")
@@ -942,6 +939,17 @@ fn apply_defaults(document: &mut ConfigDocument) {
     effects
         .entry("blur_control-center_enabled")
         .or_insert_with(|| Value::Bool(true));
+    // Per-surface blur switches were never read by the compositor or the
+    // surfaces; blur follows the global switch. Drop them from existing profiles.
+    for surface in [
+        "taskbar",
+        "launchers",
+        "widget-telemetry",
+        "control-panel",
+        "terminal",
+    ] {
+        effects.remove(&format!("blur_{surface}_enabled"));
+    }
 
     let taskbar = document
         .sections
@@ -2513,6 +2521,16 @@ mod tests {
             effects.get("blur_global_value"),
             Some(&Value::Number(50.into()))
         );
+        assert_eq!(
+            effects.get("blur_control-center_enabled"),
+            Some(&Value::Bool(true))
+        );
+        for surface in ["taskbar", "control-panel", "terminal", "launchers"] {
+            assert!(
+                effects.get(&format!("blur_{surface}_enabled")).is_none(),
+                "obsolete per-surface blur switch must not be seeded"
+            );
+        }
 
         let mut existing = empty;
         existing

@@ -1,13 +1,8 @@
 {
   "animations": true,
   "blur_control-center_enabled": true,
-  "blur_control-panel_enabled": true,
   "blur_global_enabled": true,
   "blur_global_value": 50,
-  "blur_launchers_enabled": true,
-  "blur_taskbar_enabled": true,
-  "blur_terminal_enabled": true,
-  "blur_widget-telemetry_enabled": true,
   "transparency_control-center_enabled": true,
   "transparency_control-center_value": 50,
   "transparency_control-panel_enabled": true,

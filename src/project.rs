@@ -450,11 +450,7 @@ fn project_control_panel(document: &ConfigDocument, paths: &ArgvusPaths) -> Conf
 /// When `rounded` is false (disabled), rounding must be 0 regardless of the configured value.
 /// When `rounded` is true, clamp rounding to the valid range [2..10].
 fn effective_rounding(rounded: bool, rounding: u64) -> u64 {
-    if !rounded {
-        0
-    } else {
-        rounding.clamp(2, 10)
-    }
+    if !rounded { 0 } else { rounding.clamp(2, 10) }
 }
 
 fn project_layout(document: &ConfigDocument, paths: &ArgvusPaths) -> ConfigResult<()> {

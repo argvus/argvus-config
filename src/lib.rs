@@ -1221,11 +1221,57 @@ const BLUR_SETTINGS_DEFAULTS: [(&str, f64); 7] = [
     ("blur_vibrancy_darkness", 0.0),
 ];
 
+/// Styles Hyprland 0.56.2 accepts for window open/close leaves.
+const WINDOW_ANIMATION_STYLES: [&str; 6] = [
+    "slide",
+    "popin",
+    "slidefade",
+    "slidevert",
+    "slidefadevert",
+    "gnomed",
+];
+
+/// Styles Hyprland 0.56.2 accepts for the layer leaves.
+const LAYER_ANIMATION_STYLES: [&str; 6] = [
+    "slide",
+    "popin",
+    "fade",
+    "slidefade",
+    "slidevert",
+    "slidefadevert",
+];
+
+/// Styles Hyprland 0.56.2 accepts for the workspace leaves. `popin` and
+/// `gnomed` are refused there by the compositor.
+const WORKSPACE_ANIMATION_STYLES: [&str; 5] =
+    ["slide", "fade", "slidefade", "slidevert", "slidefadevert"];
+
+/// Styles accepted by `effects.animation_<leaf>_style`, which depend on the leaf.
+fn animation_styles(key: &str) -> &'static [&'static str] {
+    match key
+        .trim_start_matches("animation_")
+        .trim_end_matches("_style")
+    {
+        "opening" | "closing" => &WINDOW_ANIMATION_STYLES,
+        "layers_in" | "layers_out" => &LAYER_ANIMATION_STYLES,
+        _ => &WORKSPACE_ANIMATION_STYLES,
+    }
+}
+
+/// Animation curves accepted by `effects.animation_<leaf>_curve`.
+const ANIMATION_CURVES: [&str; 5] = ["default", "bezier", "spring", "linear", "ease_out"];
+
 fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
     let Some(effects) = document.sections.get("effects") else {
         return Ok(());
     };
     for (key, value) in effects.as_object().expect("validated section object") {
+        // Checked before the boolean shortcut below, so a switch is accepted only
+        // where the animation settings expect one.
+        if key.starts_with("animation_") {
+            validate_animation_setting(key, value)?;
+            continue;
+        }
         if value.is_boolean() {
             continue;
         }
@@ -1247,6 +1293,56 @@ fn validate_effects(document: &ConfigDocument) -> ConfigResult<()> {
         }
     }
     Ok(())
+}
+
+/// Checks one `effects.animation_*` entry. The bounds match the table in
+/// `effects-toggle.sh`; a value outside them is refused so the compositor never
+/// receives a curve or speed it cannot parse.
+fn validate_animation_setting(key: &str, value: &Value) -> ConfigResult<()> {
+    if key.ends_with("_enabled") {
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(ConfigError::Invalid(format!(
+                "effects.{key} must be a boolean"
+            )))
+        };
+    }
+    let allowed = if key.ends_with("_style") {
+        Some(animation_styles(key))
+    } else if key.ends_with("_curve") {
+        Some(&ANIMATION_CURVES[..])
+    } else {
+        None
+    };
+    if let Some(allowed) = allowed {
+        return match value.as_str() {
+            Some(choice) if allowed.contains(&choice) => Ok(()),
+            _ => Err(ConfigError::Invalid(format!(
+                "effects.{key} must be one of {}",
+                allowed.join(", ")
+            ))),
+        };
+    }
+    let (minimum, maximum, integer) = if key.ends_with("_speed") {
+        (1.0, 10.0, false)
+    } else if key.ends_with("_popin") {
+        (1.0, 100.0, true)
+    } else {
+        match key {
+            "animation_bezier_x1" | "animation_bezier_x2" => (0.0, 1.0, false),
+            "animation_bezier_y1" | "animation_bezier_y2" => (-2.0, 3.0, false),
+            "animation_spring_mass" => (0.5, 10.0, false),
+            "animation_spring_stiffness" => (0.5, 2000.0, false),
+            "animation_spring_dampening" => (0.5, 200.0, false),
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "effects.{key} is not an animation setting"
+                )));
+            }
+        }
+    };
+    validate_blur_setting(key, value, minimum, maximum, integer)
 }
 
 fn validate_blur_setting(
@@ -2339,6 +2435,54 @@ impl Drop for LockGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_settings_accept_hyprland_values_and_refuse_the_rest() {
+        assert!(
+            validate_animation_setting("animation_opening_style", &Value::from("gnomed")).is_ok()
+        );
+        assert!(
+            validate_animation_setting("animation_opening_style", &Value::from("wobble")).is_err()
+        );
+        assert!(
+            validate_animation_setting("animation_opening_style", &Value::from("fade")).is_err()
+        );
+        assert!(
+            validate_animation_setting("animation_switching_style", &Value::from("popin")).is_err()
+        );
+        assert!(
+            validate_animation_setting("animation_workspace_in_style", &Value::from("fade"))
+                .is_ok()
+        );
+        assert!(
+            validate_animation_setting("animation_layers_in_style", &Value::from("gnomed"))
+                .is_err()
+        );
+        assert!(
+            validate_animation_setting("animation_layers_out_style", &Value::from("popin")).is_ok()
+        );
+        assert!(
+            validate_animation_setting("animation_fade_curve", &Value::from("ease_out")).is_ok()
+        );
+        assert!(
+            validate_animation_setting("animation_fade_curve", &Value::from("ease-out")).is_err()
+        );
+        assert!(validate_animation_setting("animation_opening_speed", &Value::from(5)).is_ok());
+        assert!(validate_animation_setting("animation_opening_speed", &Value::from(11)).is_err());
+        assert!(validate_animation_setting("animation_opening_speed", &Value::from(4.79)).is_ok());
+        assert!(validate_animation_setting("animation_opening_popin", &Value::from(85)).is_ok());
+        assert!(
+            validate_animation_setting("animation_moving_enabled", &Value::Bool(false)).is_ok()
+        );
+        assert!(validate_animation_setting("animation_moving_enabled", &Value::from(1)).is_err());
+        assert!(validate_animation_setting("animation_bezier_y1", &Value::from(-1.5)).is_ok());
+        assert!(validate_animation_setting("animation_bezier_x1", &Value::from(-0.1)).is_err());
+        assert!(validate_animation_setting("animation_spring_mass", &Value::from(0.2)).is_err());
+        assert!(
+            validate_animation_setting("animation_spring_stiffness", &Value::from(238.119)).is_ok()
+        );
+        assert!(validate_animation_setting("animation_unknown", &Value::from(1)).is_err());
+    }
 
     #[test]
     fn get_resolves_array_index_pointers() {

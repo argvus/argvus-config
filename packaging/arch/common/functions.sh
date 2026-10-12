@@ -20,7 +20,7 @@ arch_check_payload() {
 arch_package_payload() {
 	local source_root="${srcdir}/${pkgname}-${pkgver}"
 	install -Dm755 "$source_root/target/release/argvus-config" \
-		"$pkgdir/usr/bin/argvus-config"
+		"$pkgdir/usr/lib/argvus/commands/argvus-config"
 	install -Dm644 "$source_root/src/usr/share/argvus/config/schema.json" \
 		"$pkgdir/usr/share/argvus/config/schema.json"
 	find "$source_root/src/usr/share/argvus/config" -maxdepth 1 -type f -name '*.json' \

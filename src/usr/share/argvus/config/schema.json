@@ -12,6 +12,7 @@
         "accent": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
         "accent_custom": { "type": "boolean" },
         "gtk_mode": { "enum": ["light", "dark", "auto", "sticky"] },
+        "icon_theme": { "type": "string", "maxLength": 128, "pattern": "^(?!\\.\\.?$)[^/\\x00]*$" },
         "wallpaper": { "type": ["string", "null"] },
         "wallpaper_custom": { "type": "boolean" },
         "colors": {

@@ -293,7 +293,7 @@ impl ConfigStore {
         let root = self.config_root()?;
         let directory = self.module_directory();
         let was_missing = !directory.exists();
-        let mut document = self.load_legacy_or_modules(&root)?;
+        let mut document = self.load_legacy_or_modules(root)?;
         let before = document.clone();
         let imported = import_legacy_values(&mut document, root)?;
         let moved = migrate_legacy_layout(root)?;
@@ -443,8 +443,13 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Writes one pointer. Only that value is stored: defaults are not
+    /// materialized, so legacy values can still fill the other gaps later.
     pub fn update(&self, pointer: &str, value: Value) -> ConfigResult<ConfigDocument> {
-        self.modify(|document| document.set(pointer, value))
+        self.modify_stored(false, |document| {
+            document.set(pointer, value)?;
+            Ok(true)
+        })
     }
 
     pub fn unset(&self, pointer: &str) -> ConfigResult<ConfigDocument> {
@@ -564,14 +569,29 @@ impl ConfigStore {
     where
         F: FnOnce(&mut ConfigDocument) -> ConfigResult<bool>,
     {
+        self.modify_stored(true, operation)
+    }
+
+    /// Runs `operation` on the stored document under the canonical lock and
+    /// saves it when the operation reports a change. With `with_defaults`
+    /// the document is default-filled first; migrations pass `false` so they
+    /// see only what is stored and can import legacy values into the gaps.
+    fn modify_stored<F>(&self, with_defaults: bool, operation: F) -> ConfigResult<ConfigDocument>
+    where
+        F: FnOnce(&mut ConfigDocument) -> ConfigResult<bool>,
+    {
         let lock = self.open_lock()?;
         lock_file(&lock)?;
         let _lock_guard = LockGuard(&lock);
         let mut document = self.load_legacy_or_modules(self.config_root()?)?;
-        apply_packaged_defaults(&mut document)?;
-        apply_defaults(&mut document);
-        let before = document.clone();
-        if operation(&mut document)? && document != before {
+        if with_defaults {
+            apply_packaged_defaults(&mut document)?;
+            apply_defaults(&mut document);
+        }
+        // Compare with what the operation reports, not with a default-filled
+        // copy: writing a value equal to its default must still persist it, or
+        // a later load (which applies no defaults) would not find it.
+        if operation(&mut document)? {
             self.save_modules_locked(&document)?;
         }
         Ok(document)
@@ -579,7 +599,7 @@ impl ConfigStore {
 
     pub fn migrate_legacy(&self) -> ConfigResult<ConfigDocument> {
         let root = self.config_root()?;
-        let result = self.modify_if_changed(|document| import_legacy_values(document, root));
+        let result = self.modify_stored(false, |document| import_legacy_values(document, root));
         migrate_legacy_layout(root)?;
         result
     }
@@ -589,10 +609,12 @@ impl ConfigStore {
 /// those canonical values synchronized with the variant so the next
 /// projection cannot restore the previous mode's derived `.spaces`/`.borders`.
 fn reset_layout_geometry(document: &mut ConfigDocument, variant: &str) -> ConfigResult<()> {
+    // Float values match the documented Float mode: internal gap 10, outer gap
+    // 18, and the same 18 px taskbar margin.
     let (gaps_in, gaps_out, rounded, rounding, border_size, margins) = if variant == "float" {
-        (4, 18, true, 4, 1, [18, 18, 18, 18])
+        (10, 18, true, 4, 1, [18, 18, 18, 18])
     } else {
-        (2, 0, false, 0, 1, [0, 0, 0, 2])
+        (2, 0, false, 0, 1, [0, 0, 0, 0])
     };
     let values = [
         ("/layout/window/gaps_in", Value::from(gaps_in)),
@@ -845,6 +867,10 @@ fn apply_defaults(document: &mut ConfigDocument) {
     object
         .entry("gtk_mode")
         .or_insert_with(|| Value::String("dark".into()));
+    // Empty means "use the ARGVUS default icon theme" (see `argvus-icons`).
+    object
+        .entry("icon_theme")
+        .or_insert_with(|| Value::String(String::new()));
     let theme = object
         .get("theme")
         .and_then(Value::as_str)
@@ -869,7 +895,7 @@ fn apply_defaults(document: &mut ConfigDocument) {
             .as_object_mut()
             .expect("layout.taskbar is object");
         for (key, value) in [
-            ("margin_bottom", Value::from(2)),
+            ("margin_bottom", Value::from(0)),
             ("margin_left", Value::from(0)),
             ("margin_right", Value::from(0)),
             ("margin_top", Value::from(0)),
@@ -1181,6 +1207,16 @@ fn validate_appearance(document: &ConfigDocument) -> ConfigResult<()> {
         return Err(ConfigError::Invalid(
             "appearance.gtk_mode is invalid".into(),
         ));
+    }
+    if let Some(icon_theme) = object.get("icon_theme") {
+        let valid = icon_theme.as_str().is_some_and(|value| {
+            value.len() <= 128 && value != "." && value != ".." && !value.contains(['/', '\0'])
+        });
+        if !valid {
+            return Err(ConfigError::Invalid(
+                "appearance.icon_theme must be a plain icon theme name".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2555,6 +2591,26 @@ mod tests {
     }
 
     #[test]
+    fn float_variant_resets_geometry_to_the_documented_float_values() {
+        let mut document = ConfigDocument::default();
+
+        reset_layout_geometry(&mut document, "float").unwrap();
+
+        assert_eq!(
+            document
+                .get("/layout/window/gaps_in")
+                .and_then(Value::as_i64),
+            Some(10)
+        );
+        assert_eq!(
+            document
+                .get("/layout/window/gaps_out_top")
+                .and_then(Value::as_i64),
+            Some(18)
+        );
+    }
+
+    #[test]
     fn legacy_migration_does_not_replace_canonical_values() {
         let directory = env::temp_dir().join(format!(
             "argvus-config-test-{}-migration",
@@ -2738,7 +2794,7 @@ mod tests {
         );
         for surface in ["taskbar", "control-panel", "terminal", "launchers"] {
             assert!(
-                effects.get(&format!("blur_{surface}_enabled")).is_none(),
+                effects.get(format!("blur_{surface}_enabled")).is_none(),
                 "obsolete per-surface blur switch must not be seeded"
             );
         }
@@ -3108,7 +3164,7 @@ mod tests {
             document
                 .get("/layout/taskbar/margin_bottom")
                 .and_then(Value::as_i64),
-            Some(2)
+            Some(0)
         );
         assert_eq!(
             document.get("/appearance/accent").and_then(Value::as_str),
